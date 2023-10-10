@@ -43,10 +43,9 @@ def load_split_data(data_dir):
     test_dir = f'{data_dir}/test'
 
     train_texts, train_labels = load_data(train_dir)
-    valid_texts, valid_labels = train_texts[2000:2200], train_labels[2000:2200]
-    train_texts, train_labels = train_texts[:200], train_labels[:200]
+    valid_texts, valid_labels = train_texts[20000:], train_labels[20000:]
+    train_texts, train_labels = train_texts[:20000], train_labels[:20000]
     test_texts, test_labels = load_data(test_dir)
-    test_texts, test_labels = test_texts[:200], test_labels[:200]
 
     return train_texts, train_labels, valid_texts, valid_labels, test_texts, test_labels
 
