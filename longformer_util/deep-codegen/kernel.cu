@@ -160,7 +160,7 @@ void mm4d_cpu_mode1(float* a, float* b, float* c, int* dilation, int* params, in
 			if (condition >= 0 && condition < d2) {
 				idx_a = (((l * d2) + i) * d3 + q) *  d4a + k;
 				idx_b = (((l * d2) + i + D * (k - Window)) * d3 + q) *  d4b + j;
-				c[idx] += a[idx_a] * b[idx_b];
+				if (idx_a < aSize && idx_b < bSize)	c[idx] += a[idx_a] * b[idx_b];
 			}
 			else {
 				c[idx] += Padding;
@@ -190,7 +190,7 @@ void mm4d_cpu_mode2(float* a, float* b, float* c, int* dilation, int* params, in
 			if (condition >= 0 && condition < d2) {
 				idx_a = (((l * d2) + i + D * (k - WindowUpper)) * d3 + q) *  d4a + WindowUpper + Window - k;
 				idx_b = (((l * d2) + i + D * (k - WindowUpper)) * d3 + q) *  d4b + j;
-				c[idx] += a[idx_a] * b[idx_b];
+				if (idx_a < aSize && idx_b < bSize)	c[idx] += a[idx_a] * b[idx_b];
 			}
 			else {
 				c[idx] += Padding;
@@ -219,7 +219,7 @@ void mm4d_cpu_mode3(float* a, float* b, float* c, int* dilation, int* params, in
 			if (condition >= 0 && condition < d2) {
 				idx_a = (((l * d2) + i) * d3 + q) * d4a + k;
 				idx_b = (((l * d2) + i + D * (j - Window)) * d3 + q) *  d4b + k;
-				c[idx] += a[idx_a] * b[idx_b];
+				if (idx_a < aSize && idx_b < bSize)	c[idx] += a[idx_a] * b[idx_b];
 			}
 			else {
 				c[idx] += Padding;
@@ -255,16 +255,16 @@ void lformerMM(array4d_t<float>& input1, array4d_t<float>& input2, array4d_t<flo
         //mode 2 and mode 3 are for backward
 	if (d4c == d4b) {//mode 1 or mode 2
 		if (transposeT1 == 0) {//mode 1: can be called in forward and backward
-		        if (!GPU) mm4d_cpu_mode1(a, b, c, d, p, s_dev);
+		        if (!GPU) mm4d_cpu_mode1(a, b, c, d, p, s);
 			else mm4d_gpu_mode1 <<<gridSize, blockSize >>>(a, b, c, d, p_dev, s_dev);
 		}
                 else {// mode 2: called during gradient back-propagation
-			if (!GPU) mm4d_cpu_mode2(a, b, c, d, p, s_dev);
+			if (!GPU) mm4d_cpu_mode2(a, b, c, d, p, s);
 			else mm4d_gpu_mode2 <<<gridSize, blockSize >>>(a, b, c, d, p_dev, s_dev);
 		}
 	}
 	else {//mode 3: can be called in forward and backward
-		if (!GPU) mm4d_cpu_mode3(a, b, c, d, p, s_dev);
+		if (!GPU) mm4d_cpu_mode3(a, b, c, d, p, s);
 		else mm4d_gpu_mode3 <<<gridSize, blockSize>>>(a, b, c, d, p_dev, s_dev);
 	}
 	cudaDeviceSynchronize();

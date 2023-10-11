@@ -176,11 +176,11 @@ class DiagonaledMM(torch.autograd.Function):
         c = w_upper + w + 1  # number of diagonals
         if is_t1_diagonaled:
             assert t1.shape[3] == c
-            r = tvm.nd.empty((b, n, h, m), dtype = 'float32', device=tvm.cuda(0), mem_scope = 'global')
+            r = tvm.nd.empty((b, n, h, m), dtype = 'float32', device=tvm_device, mem_scope = 'global')
         else:
             assert not transpose_t1
             assert t1.shape[3] == m
-            r = tvm.nd.empty((b, n, h, c), dtype = 'float32', device=tvm.cuda(0), mem_scope = 'global')
+            r = tvm.nd.empty((b, n, h, c), dtype = 'float32', device=tvm_device, mem_scope = 'global')
 
         # gets function from memory, from disk or compiles it from scratch
         _diagonaled_mm_function = DiagonaledMM._get_function(dtype=dtype, device=device)
