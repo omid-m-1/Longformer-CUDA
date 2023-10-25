@@ -24,18 +24,14 @@
 
  */
 
-// mode 1 : d4c == d4b && transposeT1 == 0
-// mode 2 : d4c == d4b = d4a && transposeT1 == 1 && d4a = (Window + WindowUpper)
-// mode 3 : d4c != d4b && d4a = d4b
+// mode 1 : d4c == d4b != d4a && d4a = (Window + WindowUpper + 1) && transposeT1 == 0
+// mode 2 : d4c == d4b != d4a && d4a = (Window + WindowUpper + 1) && transposeT1 == 1
+// mode 3 : d4c != d4b && d4a = d4b && dfc == (Window + WindowUpper + 1)
 
-__global__ void mm4d_gpu_mode1(float* a, float* b, float* c, int* dilation, int* params, int* size) {
-	int d1 = size[0], d2 = size[1], d3 = size[2];
-        int d4a = size[3], d4b = size[4], d4c = size[5];
-        int aSize = size[6], bSize = size[7], cSize = size[8];
-        int Window = params[0], WindowUpper = params[1], Padding = params[2];
+__global__ void mm4d_gpu_mode1(float* a, float* b, float* c, int* dilation, int Window, int WindowUpper, int Padding, int d2, int d3, int d4a, int d4b, int d4c, int aSize, int bSize, int cSize) {
 	int idx_a, idx_b, idx;
-
 	int bx, by, tx, ty, B;
+
 	bx = blockIdx.x;
 	by = blockIdx.y;
 	tx = threadIdx.x;
@@ -65,11 +61,7 @@ __global__ void mm4d_gpu_mode1(float* a, float* b, float* c, int* dilation, int*
 	}
 }
 
-__global__ void mm4d_gpu_mode2(float* a, float* b, float* c, int* dilation, int* params, int* size) {
-	int d1 = size[0], d2 = size[1], d3 = size[2];
-        int d4a = size[3], d4b = size[4], d4c = size[5];
-        int aSize = size[6], bSize = size[7], cSize = size[8];
-        int Window = params[0], WindowUpper = params[1], Padding = params[2];
+__global__ void mm4d_gpu_mode2(float* a, float* b, float* c, int* dilation, int Window, int WindowUpper, int Padding, int d2, int d3, int d4a, int d4b, int d4c, int aSize, int bSize, int cSize) {
 	int idx_a, idx_b, idx;
 	int bx, by, tx, ty, B;
 
@@ -102,11 +94,7 @@ __global__ void mm4d_gpu_mode2(float* a, float* b, float* c, int* dilation, int*
 	}
 }
 
-__global__ void mm4d_gpu_mode3(float* a, float* b, float* c, int* dilation, int* params, int* size) {
-	int d1 = size[0], d2 = size[1], d3 = size[2];
-	int d4a = size[3], d4b = size[4], d4c = size[5];
-	int aSize = size[6], bSize = size[7], cSize = size[8];
-	int Window = params[0], WindowUpper = params[1], Padding = params[2];
+__global__ void mm4d_gpu_mode3(float* a, float* b, float* c, int* dilation, int Window, int WindowUpper, int Padding, int d2, int d3, int d4a, int d4b, int d4c, int aSize, int bSize, int cSize) {
 	int idx_a, idx_b, idx;
 	int bx, by, tx, ty, B;
 
@@ -140,11 +128,7 @@ __global__ void mm4d_gpu_mode3(float* a, float* b, float* c, int* dilation, int*
 }
 
 
-void mm4d_cpu_mode1(float* a, float* b, float* c, int* dilation, int* params, int* size) {
-	int d1 = size[0], d2 = size[1], d3 = size[2];
-        int d4a = size[3], d4b = size[4], d4c = size[5];
-        int aSize = size[6], bSize = size[7], cSize = size[8];
-        int Window = params[0], WindowUpper = params[1], Padding = params[2];
+void mm4d_cpu_mode1(float* a, float* b, float* c, int* dilation, int Window, int WindowUpper, int Padding, int d2, int d3, int d4a, int d4b, int d4c, int aSize, int bSize, int cSize) {
 	int idx_a, idx_b, idx;
 
 	for (idx = 0; idx < cSize; idx++) {
@@ -165,16 +149,11 @@ void mm4d_cpu_mode1(float* a, float* b, float* c, int* dilation, int* params, in
 			else {
 				c[idx] += Padding;
 			}
-
 		}
 	}
 }
 
-void mm4d_cpu_mode2(float* a, float* b, float* c, int* dilation, int* params, int* size) {
-	int d1 = size[0], d2 = size[1], d3 = size[2];
-        int d4a = size[3], d4b = size[4], d4c = size[5];
-        int aSize = size[6], bSize = size[7], cSize = size[8];
-        int Window = params[0], WindowUpper = params[1], Padding = params[2];
+void mm4d_cpu_mode2(float* a, float* b, float* c, int* dilation, int Window, int WindowUpper, int Padding, int d2, int d3, int d4a, int d4b, int d4c, int aSize, int bSize, int cSize) {
 	int idx_a, idx_b, idx;
 
 	for (idx = 0; idx < cSize; idx++) {
@@ -199,11 +178,7 @@ void mm4d_cpu_mode2(float* a, float* b, float* c, int* dilation, int* params, in
 	}
 }
 
-void mm4d_cpu_mode3(float* a, float* b, float* c, int* dilation, int* params, int* size) {
-	int d1 = size[0], d2 = size[1], d3 = size[2];
-        int d4a = size[3], d4b = size[4], d4c = size[5];
-        int aSize = size[6], bSize = size[7], cSize = size[8];
-        int Window = params[0], WindowUpper = params[1], Padding = params[2];
+void mm4d_cpu_mode3(float* a, float* b, float* c, int* dilation, int Window, int WindowUpper, int Padding, int d2, int d3, int d4a, int d4b, int d4c, int aSize, int bSize, int cSize) {
 	int idx_a, idx_b, idx;
 
 	for (idx = 0; idx < cSize; idx++) {
@@ -233,20 +208,8 @@ void lformerMM(array4d_t<float>& input1, array4d_t<float>& input2, array4d_t<flo
 	float* a = input1.data_ptr, *b = input2.data_ptr, *c = output1.data_ptr;
 	int d1 = output1.last_count, d2 = output1.matrix_count, d3 = output1.row_count;
 	int d4a = input1.col_count, d4b = input2.col_count, d4c = output1.col_count;
+	int aSize = d1*d2*d3*d4a, bSize = d1*d2*d3*d4b, cSize = d1*d2*d3*d4c;
 	int Window = params.data_ptr[0], WindowUpper = params.data_ptr[1], Padding = params.data_ptr[2], transposeT1 = params.data_ptr[3];
-
-	int *p, *p_dev;
-        cudaMallocHost(&p, 3 * sizeof(int));
-        p[0] = Window, p[1] = WindowUpper, p[2] = Padding;
-        cudaMalloc(&p_dev, 3 * sizeof(int));
-        cudaMemcpy(p_dev, p, 3 * sizeof(int), cudaMemcpyHostToDevice);
-
-	int* s, *s_dev;
-	cudaMallocHost(&s, 9 * sizeof(int));
-	s[0] = d1, s[1] = d2, s[2] = d3, s[3] = d4a, s[4] = d4b, s[5] = d4c;
-	s[6] = d1*d2*d3*d4a, s[7] = d1*d2*d3*d4b, s[8] = d1*d2*d3*d4c;
-	cudaMalloc(&s_dev, 9 * sizeof(int));
-	cudaMemcpy(s_dev, s, 9 * sizeof(int), cudaMemcpyHostToDevice);
 
 	dim3 blockSize(16, 16);
 	dim3 gridSize((d1 * d2 + blockSize.x - 1) / blockSize.x, (d3 * d4c + blockSize.y - 1) / blockSize.y);
@@ -255,18 +218,16 @@ void lformerMM(array4d_t<float>& input1, array4d_t<float>& input2, array4d_t<flo
         //mode 2 and mode 3 are for backward
 	if (d4c == d4b) {//mode 1 or mode 2
 		if (transposeT1 == 0) {//mode 1: can be called in forward and backward
-		        if (!GPU) mm4d_cpu_mode1(a, b, c, d, p, s);
-			else mm4d_gpu_mode1 <<<gridSize, blockSize >>>(a, b, c, d, p_dev, s_dev);
+		        if (!GPU) mm4d_cpu_mode1(a, b, c, d, Window, WindowUpper, Padding, d2, d3, d4a, d4b, d4c, aSize, bSize, cSize);
+			else mm4d_gpu_mode1 <<<gridSize, blockSize >>>(a, b, c, d, Window, WindowUpper, Padding, d2, d3, d4a, d4b, d4c, aSize, bSize, cSize);
 		}
                 else {// mode 2: called during gradient back-propagation
-			if (!GPU) mm4d_cpu_mode2(a, b, c, d, p, s);
-			else mm4d_gpu_mode2 <<<gridSize, blockSize >>>(a, b, c, d, p_dev, s_dev);
+			if (!GPU) mm4d_cpu_mode2(a, b, c, d, Window, WindowUpper, Padding, d2, d3, d4a, d4b, d4c, aSize, bSize, cSize);
+			else mm4d_gpu_mode2 <<<gridSize, blockSize >>>(a, b, c, d, Window, WindowUpper, Padding, d2, d3, d4a, d4b, d4c, aSize, bSize, cSize);
 		}
 	}
 	else {//mode 3: can be called in forward and backward
-		if (!GPU) mm4d_cpu_mode3(a, b, c, d, p, s);
-		else mm4d_gpu_mode3 <<<gridSize, blockSize>>>(a, b, c, d, p_dev, s_dev);
+		if (!GPU) mm4d_cpu_mode3(a, b, c, d, Window, WindowUpper, Padding, d2, d3, d4a, d4b, d4c, aSize, bSize, cSize);
+		else mm4d_gpu_mode3 <<<gridSize, blockSize>>>(a, b, c, d, Window, WindowUpper, Padding, d2, d3, d4a, d4b, d4c, aSize, bSize, cSize);
 	}
-	cudaDeviceSynchronize();
-        cudaFree(s_dev); cudaFreeHost(s); cudaFree(p_dev); cudaFreeHost(p);
 }
