@@ -51,7 +51,7 @@ if __name__ == '__main__':
     if mode == 1:
         input1_dimensions[3] = 2 * window + 1
     else:
-        input1_dimensions[3] = input1_dimensions[2]
+        input1_dimensions[3] = input2_dimensions[3]
 
     if dilation == None:
         dilation = [1]*input1_dimensions[2]
