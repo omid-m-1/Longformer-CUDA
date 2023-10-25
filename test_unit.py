@@ -21,6 +21,7 @@ if __name__ == '__main__':
     parser.add_argument('--dilation', type=int, nargs='+', default=None, help='enter heads dimensions')
     parser.add_argument('--window', type=int, default=16)
     parser.add_argument('--padding', type=int, default=0)
+    parser.add_argument('--autoregressive', default=False, action='store_true')
 
     args = parser.parse_args()
     kernel = args.kernel
@@ -30,6 +31,8 @@ if __name__ == '__main__':
     dilation = args.dilation
     window = args.window
     padding = args.padding
+    autoregressive = args.autoregressive
+    window_upper = 0 if autoregressive else window
 
     if mode != 1 and mode != 3:
         raise ValueError("Forward step has mode 1 and 3")
@@ -49,7 +52,7 @@ if __name__ == '__main__':
         raise ValueError("First three dimensions should be the same")
 
     if mode == 1:
-        input1_dimensions[3] = 2 * window + 1
+        input1_dimensions[3] = window + window_upper + 1
     else:
         input1_dimensions[3] = input2_dimensions[3]
 
@@ -69,9 +72,9 @@ if __name__ == '__main__':
     start = time.time()
 
     if kernel == 'dcg':
-        output1 = lformerMM(input1, input2, window, dilation, is_diagonal, padding)
+        output1 = lformerMM(input1, input2, window, dilation, is_diagonal, padding, autoregressive)
     else:
-        output1 = diagonaled_mm(input1, input2, window, dilation, is_diagonal, padding)
+        output1 = diagonaled_mm(input1, input2, window, dilation, is_diagonal, padding, autoregressive)
     random_target = torch.rand_like(output1, device=device)
     loss = (output1 - random_target).pow(2).mean()
     loss.backward()
