@@ -47,7 +47,7 @@ __global__ void mm4d_gpu_mode1(float* a, float* b, float* c, int* dilation, int 
 
 	if (idx < cSize) {
 	c[idx] = 0.0f;
-	for (int k = 0; k < d4c; k++) {
+	for (int k = 0; k < d4a; k++) {
 		int condition = i + D * (k - Window);
 		if (condition >= 0 && condition < d2) {
 			idx_a = (((l * d2) + i) * d3 + q) *  d4a + k;
@@ -80,7 +80,7 @@ __global__ void mm4d_gpu_mode2(float* a, float* b, float* c, int* dilation, int 
 
 	if (idx < cSize) {
 	c[idx] = 0.0f;
-	for (int k = 0; k < d4c; k++) {
+	for (int k = 0; k < d4a; k++) {
 		int condition = i + D * (k - WindowUpper);
 		if (condition >= 0 && condition < d2) {
 			idx_a = (((l * d2) + i + D * (k - WindowUpper)) * d3 + q) *  d4a + WindowUpper + Window - k;
@@ -113,7 +113,7 @@ __global__ void mm4d_gpu_mode3(float* a, float* b, float* c, int* dilation, int 
 
 	if (idx < cSize) {
 	c[0] = 0.0f;
-	for (int k = 0; k < d4c; k++) {
+	for (int k = 0; k < d4a; k++) {
 		int condition = i + D * (j - Window);
 		if (condition >= 0 && condition < d2) {
 			idx_a = (((l * d2) + i) * d3 + q) * d4a + k;
@@ -139,7 +139,7 @@ void mm4d_cpu_mode1(float* a, float* b, float* c, int* dilation, int Window, int
 		int D = dilation[q];
 		c[idx] = 0.0f;
 
-		for (int k = 0; k < d4c; k++) {
+		for (int k = 0; k < d4a; k++) {
 			int condition = i + D * (k - Window);
 			if (condition >= 0 && condition < d2) {
 				idx_a = (((l * d2) + i) * d3 + q) *  d4a + k;
@@ -164,7 +164,7 @@ void mm4d_cpu_mode2(float* a, float* b, float* c, int* dilation, int Window, int
 		int D = dilation[q];
 		c[idx] = 0.0f;
 
-		for (int k = 0; k < d4c; k++) {
+		for (int k = 0; k < d4a; k++) {
 			int condition = i + D * (k - WindowUpper);
 			if (condition >= 0 && condition < d2) {
 				idx_a = (((l * d2) + i + D * (k - WindowUpper)) * d3 + q) *  d4a + WindowUpper + Window - k;
@@ -189,7 +189,7 @@ void mm4d_cpu_mode3(float* a, float* b, float* c, int* dilation, int Window, int
 		int D = dilation[q];
 		c[idx] = 0.0f;
 
-		for (int k = 0; k < d4c; k++) {
+		for (int k = 0; k < d4a; k++) {
 			int condition = i + D * (j - Window);
 			if (condition >= 0 && condition < d2) {
 				idx_a = (((l * d2) + i) * d3 + q) * d4a + k;
