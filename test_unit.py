@@ -1,14 +1,15 @@
 import torch
 import time
 from longformer_util.diagonaled_mm_tvm import diagonaled_mm
+from torch.profiler import profile, record_function, ProfilerActivity
 
 import importlib
 lformerMM = importlib.import_module("longformer_util.deep-codegen.pytorch_apis").lformerMM
 
 import argparse
 
-default_input1 = [32,64,8,-1]
-default_input2 = [32,64,8,64]
+default_input1 = [2, 4096, 12, -1]
+default_input2 = [2, 4096, 12, 64]
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -69,16 +70,12 @@ if __name__ == '__main__':
     input2 = torch.rand(input2_dimensions, requires_grad=True, device=device)
     dilation = torch.tensor(dilation, dtype=torch.int, requires_grad=False, device=device)
 
-    start = time.time()
-
-    if kernel == 'dcg':
-        output1 = lformerMM(input1, input2, window, dilation, is_diagonal, padding, autoregressive)
-    else:
-        output1 = diagonaled_mm(input1, input2, window, dilation, is_diagonal, padding, autoregressive)
-    random_target = torch.rand_like(output1, device=device)
-    loss = (output1 - random_target).pow(2).mean()
-    loss.backward()
-
-    end = time.time()
-
-    print(f'{kernel} kernel took {end-start} seconds')
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+        if kernel == 'dcg':
+            output1 = lformerMM(input1, input2, window, dilation, is_diagonal, padding, autoregressive)
+        else:
+            output1 = diagonaled_mm(input1, input2, window, dilation, is_diagonal, padding, autoregressive)
+        random_target = torch.rand_like(output1, device=device)
+        loss = (output1 - random_target).pow(2).mean()
+        loss.backward()
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
