@@ -47,7 +47,7 @@ class lformerMM_impl(th.autograd.Function):
         if isinstance(dilation, int):
             dilation = input1.new_full(size=(input1.shape[2],), fill_value=dilation, dtype=th.int, requires_grad=False, device=device0)
         dim1_0, dim1_1, dim1_2, dim1_3 = lformerMM_impl._out_size(input1, input2, window, dilation, is_diagonal, autoregressive=autoregressive)
-        params = params = th.tensor([window, 0 if autoregressive else window, padding, 0])
+        params = th.tensor([window, 0 if autoregressive else window, padding, 0])
         res = gp_apis.gp_lformerMM(input1, input2, dim1_0, dim1_1, dim1_2, dim1_3, dilation, params, device0)
         ctx.backward_cache = (input1, input2, dilation) #must be implemented
         ctx.window = window
