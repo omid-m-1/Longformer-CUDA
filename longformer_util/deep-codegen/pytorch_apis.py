@@ -45,16 +45,9 @@ class lformerMM_impl(th.autograd.Function):
         input1 = lformerMM_impl._prepare_tensors(input1)
         input2 = lformerMM_impl._prepare_tensors(input2)
         if isinstance(dilation, int):
-            dilation = input1.new_full(size=(input1.shape[2],), fill_value=dilation, dtype=th.int, requires_grad=False)
-        dilation.to(device0)
+            dilation = input1.new_full(size=(input1.shape[2],), fill_value=dilation, dtype=th.int, requires_grad=False, device=device0)
         dim1_0, dim1_1, dim1_2, dim1_3 = lformerMM_impl._out_size(input1, input2, window, dilation, is_diagonal, autoregressive=autoregressive)
-        params = th.zeros((4),dtype=th.int32)
-        params[0] = window
-        params[1] = 0 if autoregressive else window
-        params[2] = padding
-        params[3] = 0
-        window_upper = 0 if autoregressive else window
-        is_transposed = 0
+        params = params = th.tensor([window, 0 if autoregressive else window, padding, 0])
         res = gp_apis.gp_lformerMM(input1, input2, dim1_0, dim1_1, dim1_2, dim1_3, dilation, params, device0)
         ctx.backward_cache = (input1, input2, dilation) #must be implemented
         ctx.window = window
@@ -75,18 +68,11 @@ class lformerMM_impl(th.autograd.Function):
         if not dZ.is_contiguous():
             dZ = dZ.contiguous()
         dZ = lformerMM_impl._prepare_tensors(dZ)
-        params = th.zeros((4),dtype=th.int32)
-        params[0] = window
-        params[1] = 0 if autoregressive else window
-        params[2] = 0
-        params[3] = 0
+        params = th.tensor([window, 0 if autoregressive else window, 0, 0])
         is_diagonal = not is_diagonal
         dim1_0, dim1_1, dim1_2, dim1_3 = lformerMM_impl._out_size(dZ, input2, window, dilation, is_diagonal, autoregressive=autoregressive)
-        window_upper = 0 if autoregressive else window
-        is_transposed = 0
         grd1 = gp_apis.gp_lformerMM(dZ, input2, dim1_0, dim1_1, dim1_2, dim1_3, dilation, params, device0)
-        params[3] = 1
-        is_transposed = 1
+        params = th.tensor([window, 0 if autoregressive else window, 0, 1])
         if is_diagonal:
             dim1_0, dim1_1, dim1_2, dim1_3 = lformerMM_impl._out_size(dZ, input1, window, dilation, True, True, autoregressive=autoregressive)
             grd2 = gp_apis.gp_lformerMM(dZ, input1, dim1_0, dim1_1, dim1_2, dim1_3, dilation, params, device0)
