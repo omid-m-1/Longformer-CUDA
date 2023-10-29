@@ -114,15 +114,15 @@ __global__ void mm4d_gpu_mode3(float* a, float* b, float* c, int* dilation, int 
 	if (idx < cSize) {
 		c[0] = 0.0f;
 		int condition = i + D * (j - Window);
-		if (condition >= 0 && condition < d2) {
-			for (int k = 0; k < d4a; k++) {
+		for (int k = 0; k < d4a; k++) {
+			if (condition >= 0 && condition < d2) {
 				idx_a = (((l * d2) + i) * d3 + q) * d4a + k;
 				idx_b = (((l * d2) + i + D * (j - Window)) * d3 + q) *  d4b + k;
 				if (idx_a < aSize && idx_b < bSize)	c[idx] += a[idx_a] * b[idx_b];
 			}
-		}
-		else {
-			c[idx] += Padding;
+			else {
+				c[idx] += Padding;
+			}
 		}
 	}
 }
@@ -190,15 +190,15 @@ void mm4d_cpu_mode3(float* a, float* b, float* c, int* dilation, int Window, int
 		c[idx] = 0.0f;
 
 		int condition = i + D * (j - Window);
-		if (condition >= 0 && condition < d2) {
-			for (int k = 0; k < d4a; k++) {
+		for (int k = 0; k < d4a; k++) {
+			if (condition >= 0 && condition < d2) {
 				idx_a = (((l * d2) + i) * d3 + q) * d4a + k;
 				idx_b = (((l * d2) + i + D * (j - Window)) * d3 + q) *  d4b + k;
 				if (idx_a < aSize && idx_b < bSize)	c[idx] += a[idx_a] * b[idx_b];
 			}
-		}
-		else {
-			c[idx] += Padding;
+			else {
+				c[idx] += Padding;
+			}
 		}
 	}
 }
