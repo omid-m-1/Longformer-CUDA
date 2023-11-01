@@ -23,7 +23,7 @@ if __name__ == '__main__':
     parser.add_argument('--window', type=int, default=16)
     parser.add_argument('--padding', type=int, default=0)
     parser.add_argument('--autoregressive', default=False, action='store_true')
-    parser.add_argument('--coalsced', default=False, action='store_true')
+    parser.add_argument('--coalesced', default=False, action='store_true')
 
     args = parser.parse_args()
     kernel = args.kernel
@@ -35,7 +35,7 @@ if __name__ == '__main__':
     padding = args.padding
     autoregressive = args.autoregressive
     window_upper = 0 if autoregressive else window
-    coalsced = 1 if args.coalsced else 0
+    coalesced = 1 if args.coalesced else 0
 
     if mode != 1 and mode != 3:
         raise ValueError("Forward step has mode 1 and 3")
@@ -74,7 +74,7 @@ if __name__ == '__main__':
 
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
         if kernel == 'dcg':
-            output1 = lformerMM(input1, input2, window, dilation, is_diagonal, padding, autoregressive, coalsced)
+            output1 = lformerMM(input1, input2, window, dilation, is_diagonal, padding, autoregressive, coalesced)
         else:
             output1 = diagonaled_mm(input1, input2, window, dilation, is_diagonal, padding, autoregressive)
         random_target = torch.rand_like(output1, device=device)

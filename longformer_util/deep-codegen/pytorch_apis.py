@@ -45,9 +45,9 @@ class lformerMM_impl(th.autograd.Function):
         input1 = lformerMM_impl._prepare_tensors(input1)
         input2 = lformerMM_impl._prepare_tensors(input2)
         if isinstance(dilation, int):
-            dilation = input1.new_full(size=(input1.shape[2],), fill_value=dilation, dtype=th.int, requires_grad=False, device=device0)
+            dilation = input1.new_full(size=(input1.shape[2],), fill_value=dilation, dtype=th.int, requires_grad=False, device=device0, dtype=th.int)
         dim1_0, dim1_1, dim1_2, dim1_3 = lformerMM_impl._out_size(input1, input2, window, dilation, is_diagonal, autoregressive=autoregressive)
-        params = th.tensor([window, 0 if autoregressive else window, padding, 0, coalesced])
+        params = th.tensor([window, 0 if autoregressive else window, padding, 0, coalesced], dtype=th.int)
         mode3 = 1 if (input1.shape[3] == input2.shape[3]) else 0
         res = gp_apis.gp_lformerMM(input1, input2, dim1_0, dim1_1, dim1_2, dim1_3, dilation, params, device0, mode3)
         ctx.backward_cache = (input1, input2, dilation) #must be implemented
@@ -69,12 +69,12 @@ class lformerMM_impl(th.autograd.Function):
         if not dZ.is_contiguous():
             dZ = dZ.contiguous()
         dZ = lformerMM_impl._prepare_tensors(dZ)
-        params = th.tensor([window, 0 if autoregressive else window, 0, 0, coalesced])
+        params = th.tensor([window, 0 if autoregressive else window, 0, 0, coalesced], dtype=th.int)
         is_diagonal = not is_diagonal
         dim1_0, dim1_1, dim1_2, dim1_3 = lformerMM_impl._out_size(dZ, input2, window, dilation, is_diagonal, autoregressive=autoregressive)
         mode3 = 1 if (dZ.shape[3] == input2.shape[3]) else 0
         grd1 = gp_apis.gp_lformerMM(dZ, input2, dim1_0, dim1_1, dim1_2, dim1_3, dilation, params, device0, mode3)
-        params = th.tensor([window, 0 if autoregressive else window, 0, 1, coalesced])
+        params = th.tensor([window, 0 if autoregressive else window, 0, 1, coalesced], dtype=th.int)
         mode3 = 1 if (dZ.shape[3] == input1.shape[3]) else 0
         if is_diagonal:
             dim1_0, dim1_1, dim1_2, dim1_3 = lformerMM_impl._out_size(dZ, input1, window, dilation, True, True, autoregressive=autoregressive)
