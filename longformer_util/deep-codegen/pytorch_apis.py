@@ -45,7 +45,7 @@ class lformerMM_impl(th.autograd.Function):
         input1 = lformerMM_impl._prepare_tensors(input1)
         input2 = lformerMM_impl._prepare_tensors(input2)
         if isinstance(dilation, int):
-            dilation = input1.new_full(size=(input1.shape[2],), fill_value=dilation, dtype=th.int, requires_grad=False, device=device0, dtype=th.int)
+            dilation = input1.new_full(size=(input1.shape[2],), fill_value=dilation, dtype=th.int, requires_grad=False, device=device0)
         dim1_0, dim1_1, dim1_2, dim1_3 = lformerMM_impl._out_size(input1, input2, window, dilation, is_diagonal, autoregressive=autoregressive)
         params = th.tensor([window, 0 if autoregressive else window, padding, 0, coalesced], dtype=th.int)
         mode3 = 1 if (input1.shape[3] == input2.shape[3]) else 0

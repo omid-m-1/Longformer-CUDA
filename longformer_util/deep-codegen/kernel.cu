@@ -420,6 +420,7 @@ void lformerMM(array4d_t<float>& input1, array4d_t<float>& input2, array4d_t<flo
 	int aSize = d1*d2*d3*d4a, bSize = d1*d2*d3*d4b, cSize = d1*d2*d3*d4c;
 	int Window = params.data_ptr[0], WindowUpper = params.data_ptr[1], Padding = params.data_ptr[2], transposeT1 = params.data_ptr[3], coalesced = params.data_ptr[4];
 	if (coalesced == 1) d4a = input1.row_count;
+	printf("params: %d %d %d %d %d\n", Window, WindowUpper, Padding, transposeT1, coalesced);
 
 	dim3 blockSize(16, 16);
 	dim3 gridSize((d1 * d2 + blockSize.x - 1) / blockSize.x, (d3 * d4c + blockSize.y - 1) / blockSize.y);

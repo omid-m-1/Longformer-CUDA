@@ -20,10 +20,11 @@ if __name__ == '__main__':
     parser.add_argument('--input1_dimensions', type=int, nargs='+', default=None, help='enter four digits')
     parser.add_argument('--input2_dimensions', type=int, nargs='+', default=None, help='enter four digits')
     parser.add_argument('--dilation', type=int, nargs='+', default=None, help='enter heads dimensions')
-    parser.add_argument('--window', type=int, default=16)
+    parser.add_argument('--window', type=int, default=256)
     parser.add_argument('--padding', type=int, default=0)
     parser.add_argument('--autoregressive', default=False, action='store_true')
     parser.add_argument('--coalesced', default=False, action='store_true')
+    parser.add_argument('--chk', default=False, action='store_true')
 
     args = parser.parse_args()
     kernel = args.kernel
@@ -81,3 +82,11 @@ if __name__ == '__main__':
         loss = (output1 - random_target).pow(2).mean()
         loss.backward()
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+
+    if args.chk == True and kernel == 'dcg':
+        output2 = diagonaled_mm(input1, input2, window, dilation, is_diagonal, padding, autoregressive)
+        loss = (output1 - output2).pow(2).mean()
+        if loss < (10 ** -6): print("dcg and tvm outputs are matched")
+        else: print("dcg and tvm outputs are not matched")
+
+
