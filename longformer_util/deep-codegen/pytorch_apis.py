@@ -48,8 +48,7 @@ class lformerMM_impl(th.autograd.Function):
             dilation = input1.new_full(size=(input1.shape[2],), fill_value=dilation, dtype=th.int, requires_grad=False, device=device0)
         dim1_0, dim1_1, dim1_2, dim1_3 = lformerMM_impl._out_size(input1, input2, window, dilation, is_diagonal, autoregressive=autoregressive)
         params = th.tensor([window, 0 if autoregressive else window, padding, 0, coalesced], dtype=th.int)
-        mode3 = 1 if (input1.shape[3] == input2.shape[3]) else 0
-        res = gp_apis.gp_lformerMM(input1, input2, dim1_0, dim1_1, dim1_2, dim1_3, dilation, params, device0, mode3)
+        res = gp_apis.gp_lformerMM(input1, input2, dim1_0, dim1_1, dim1_2, dim1_3, dilation, params, device0)
         ctx.backward_cache = (input1, input2, dilation) #must be implemented
         ctx.window = window
         ctx.is_diagonal = is_diagonal
@@ -72,17 +71,15 @@ class lformerMM_impl(th.autograd.Function):
         params = th.tensor([window, 0 if autoregressive else window, 0, 0, coalesced], dtype=th.int)
         is_diagonal = not is_diagonal
         dim1_0, dim1_1, dim1_2, dim1_3 = lformerMM_impl._out_size(dZ, input2, window, dilation, is_diagonal, autoregressive=autoregressive)
-        mode3 = 1 if (dZ.shape[3] == input2.shape[3]) else 0
-        grd1 = gp_apis.gp_lformerMM(dZ, input2, dim1_0, dim1_1, dim1_2, dim1_3, dilation, params, device0, mode3)
+        grd1 = gp_apis.gp_lformerMM(dZ, input2, dim1_0, dim1_1, dim1_2, dim1_3, dilation, params, device0)
         params = th.tensor([window, 0 if autoregressive else window, 0, 1, coalesced], dtype=th.int)
-        mode3 = 1 if (dZ.shape[3] == input1.shape[3]) else 0
         if is_diagonal:
             dim1_0, dim1_1, dim1_2, dim1_3 = lformerMM_impl._out_size(dZ, input1, window, dilation, True, True, autoregressive=autoregressive)
-            grd2 = gp_apis.gp_lformerMM(dZ, input1, dim1_0, dim1_1, dim1_2, dim1_3, dilation, params, device0, mode3)
+            grd2 = gp_apis.gp_lformerMM(dZ, input1, dim1_0, dim1_1, dim1_2, dim1_3, dilation, params, device0)
         else:
             dim1_0, dim1_1, dim1_2, dim1_3 = lformerMM_impl._out_size(input1, dZ, window, dilation, True, True, autoregressive=autoregressive)
-            grd2 = gp_apis.gp_lformerMM(input1, dZ, dim1_0, dim1_1, dim1_2, dim1_3, dilation, params, device0, mode3)
-        return grd1, grd2, None, None, None, None, None, None
+            grd2 = gp_apis.gp_lformerMM(input1, dZ, dim1_0, dim1_1, dim1_2, dim1_3, dilation, params, device0)
+        return grd1, grd2, None, None, None, None, None, None, None
 
 def lformerMM(input1, input2, window, dilation, is_diagonal = False, padding = 0, autoregressive = False, coalesced = 0):
     return lformerMM_impl.apply(input1, input2, window, dilation, is_diagonal, padding, autoregressive, coalesced)

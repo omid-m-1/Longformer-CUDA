@@ -50,7 +50,7 @@ __global__ void mm4d_gpu_mode1_c_padz(float* a, float* b, float* c, int* dilatio
 		for (int k = 0; k < d4a; k++) {
 			int condition = i + D * (k - Window);
 			if (condition >= 0 && condition < d2) {
-				idx_a = (((l * d2) + i) * d4a + k) * d3 + q;
+				idx_a = (((l * d2) + i) * d3 + q) *  d4a + k;
 				idx_b = (((l * d2) + i + D * (k - Window)) * d3 + q) *  d4b + j;
 				if (idx_a < aSize && idx_b < bSize)	c[idx] += a[idx_a] * b[idx_b];
 			}
@@ -80,8 +80,8 @@ __global__ void mm4d_gpu_mode3_c_padz(float* a, float* b, float* c, int* dilatio
 		int condition = i + D * (j - Window);
 		if (condition >= 0 && condition < d2) {
 			for (int k = 0; k < d4a; k++) {
-				idx_a = (((l * d2) + i) * d4a + k) * d3 + q;
-				idx_b = (((l * d2) + i + D * (j - Window)) * d4b + k) * d3 + q;
+				idx_a = (((l * d2) + i) * d3 + q) *  d4a + k;
+				idx_b = (((l * d2) + i + D * (j - Window)) * d3 + q) *  d4b + k;
 				if (idx_a < aSize && idx_b < bSize)	c[idx] += a[idx_a] * b[idx_b];
 			}
 		}
@@ -110,7 +110,7 @@ __global__ void mm4d_gpu_mode1_c(float* a, float* b, float* c, int* dilation, in
 		for (int k = 0; k < d4a; k++) {
 			int condition = i + D * (k - Window);
 			if (condition >= 0 && condition < d2) {
-				idx_a = (((l * d2) + i) * d4a + k) * d3 + q;
+				idx_a = (((l * d2) + i) * d3 + q) *  d4a + k;
 				idx_b = (((l * d2) + i + D * (k - Window)) * d3 + q) *  d4b + j;
 				if (idx_a < aSize && idx_b < bSize)	c[idx] += a[idx_a] * b[idx_b];
 			}
@@ -143,7 +143,7 @@ __global__ void mm4d_gpu_mode2_c(float* a, float* b, float* c, int* dilation, in
 		for (int k = 0; k < d4a; k++) {
 			int condition = i + D * (k - WindowUpper);
 			if (condition >= 0 && condition < d2) {
-				idx_a = (((l * d2) + i + D * (k - WindowUpper)) * d4a + WindowUpper + Window - k) * d3 + q;
+				idx_a = (((l * d2) + i + D * (k - WindowUpper)) * d3 + q) *  d4a + WindowUpper + Window - k;
 				idx_b = (((l * d2) + i + D * (k - WindowUpper)) * d3 + q) *  d4b + j;
 				if (idx_a < aSize && idx_b < bSize)	c[idx] += a[idx_a] * b[idx_b];
 			}
@@ -173,8 +173,8 @@ __global__ void mm4d_gpu_mode3_c(float* a, float* b, float* c, int* dilation, in
 		int condition = i + D * (j - Window);
 		for (int k = 0; k < d4a; k++) {
 			if (condition >= 0 && condition < d2) {
-				idx_a = (((l * d2) + i) * d4a + k) * d3 + q;
-				idx_b = (((l * d2) + i + D * (j - Window)) * d4b + k) * d3 + q;
+				idx_a = (((l * d2) + i) * d3 + q) *  d4a + k;
+				idx_b = (((l * d2) + i + D * (j - Window)) * d3 + q) *  d4b + k;
 				if (idx_a < aSize && idx_b < bSize)	c[idx] += a[idx_a] * b[idx_b];
 			}
 			else {
@@ -419,7 +419,6 @@ void lformerMM(array4d_t<float>& input1, array4d_t<float>& input2, array4d_t<flo
 	int d4a = input1.col_count, d4b = input2.col_count, d4c = output1.col_count;
 	int aSize = d1*d2*d3*d4a, bSize = d1*d2*d3*d4b, cSize = d1*d2*d3*d4c;
 	int Window = params.data_ptr[0], WindowUpper = params.data_ptr[1], Padding = params.data_ptr[2], transposeT1 = params.data_ptr[3], coalesced = params.data_ptr[4];
-	if (coalesced == 1) d4a = input1.row_count;
 	printf("params: %d %d %d %d %d\n", Window, WindowUpper, Padding, transposeT1, coalesced);
 
 	dim3 blockSize(16, 16);
@@ -442,7 +441,6 @@ void lformerMM(array4d_t<float>& input1, array4d_t<float>& input2, array4d_t<flo
 		}
 	}
 	else {//mode 3: can be called in forward and backward
-		if (coalesced == 1) d4b = input2.row_count;
 		if (!GPU) mm4d_cpu_mode3(a, b, c, d, Window, Padding, d2, d3, d4a, d4b, d4c, aSize, bSize, cSize);
 		else if (coalesced == 1 && Padding == 0) mm4d_gpu_mode3_c_padz <<<gridSize, blockSize>>>(a, b, c, d, Window, Padding, d2, d3, d4a, d4b, d4c, aSize, bSize, cSize);
 		else if (coalesced == 1) mm4d_gpu_mode3_c <<<gridSize, blockSize>>>(a, b, c, d, Window, Padding, d2, d3, d4a, d4b, d4c, aSize, bSize, cSize);
