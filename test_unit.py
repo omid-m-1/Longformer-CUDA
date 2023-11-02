@@ -39,7 +39,7 @@ if __name__ == '__main__':
     coalesced = 1 if args.coalesced else 0
 
     if mode != 1 and mode != 3:
-        raise ValueError("Forward step has mode 1 and 3")
+        raise ValueError('Forward step has mode 1 and 3')
 
     is_diagonal = False if mode == 3 else True
 
@@ -50,10 +50,10 @@ if __name__ == '__main__':
         input2_dimensions = default_input2
 
     if len(input1_dimensions) != 4 or len(input2_dimensions) != 4:
-        raise ValueError("Inputs should be 4D")
+        raise ValueError('Inputs should be 4D')
 
     if input1_dimensions[:3] != input2_dimensions[:3]:
-        raise ValueError("First three dimensions should be the same")
+        raise ValueError('First three dimensions should be the same')
 
     if mode == 1:
         input1_dimensions[3] = window + window_upper + 1
@@ -67,7 +67,7 @@ if __name__ == '__main__':
         dilation = dilation*input1_dimensions[2]
 
     if len(dilation) != input1_dimensions[2]:
-        raise ValueError("Dilation should be equal to heads")
+        raise ValueError('Dilation should be equal to heads')
 
     input1 = torch.rand(input1_dimensions, requires_grad=True, device=device)
     input2 = torch.rand(input2_dimensions, requires_grad=True, device=device)
@@ -81,12 +81,12 @@ if __name__ == '__main__':
         random_target = torch.rand_like(output1, device=device)
         loss = (output1 - random_target).pow(2).mean()
         loss.backward()
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10))
 
-    if args.chk == True and kernel == 'dcg':
+    if (args.chk == True) and (kernel == 'dcg'):
         output2 = diagonaled_mm(input1, input2, window, dilation, is_diagonal, padding, autoregressive)
         loss = (output1 - output2).pow(2).mean()
-        if loss < (10 ** -6): print("dcg and tvm outputs are matched")
-        else: print("dcg and tvm outputs are not matched")
+        if loss < (10 ** -6): print('dcg and tvm outputs are matched')
+        else: print('dcg and tvm outputs are not matched')
 
 
