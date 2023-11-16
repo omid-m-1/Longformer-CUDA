@@ -79,14 +79,17 @@ if __name__ == '__main__':
         else:
             output1 = diagonaled_mm(input1, input2, window, dilation, is_diagonal, padding, autoregressive)
         random_target = torch.rand_like(output1, device=device)
-        loss = (output1 - random_target).pow(2).mean()
-        loss.backward()
+        #loss = (output1 - random_target).pow(2).mean()
+        #loss.backward()
     print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10))
 
     if (args.chk == True) and (kernel == 'dcg'):
         output2 = diagonaled_mm(input1, input2, window, dilation, is_diagonal, padding, autoregressive)
+        print("dcg", output1)
+        print("tvm", output2)
         loss = (output1 - output2).pow(2).mean()
         if loss < (10 ** -6): print('dcg and tvm outputs are matched')
         else: print('dcg and tvm outputs are not matched')
 
-
+#print(output1[0,0,1,:])
+#print(output2[0,0,1,:])
