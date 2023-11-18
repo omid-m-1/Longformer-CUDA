@@ -15,7 +15,7 @@
 
 //Matrix A: input features/attention scores/gradients of enwik8/text8, 4 dimension: d1, d2, d3 and d4
 #include <stdio.h>
-//#include "wtime.h"
+#include "wtime.h"
 
 //Matrix B: it can be input features/values/gradients, 4 dimensions
 //Matrix C: Output result : attention scores/weighted sum/gradients
@@ -46,7 +46,8 @@ const int d2d3d4c = d2*d3*d4c;
 const int d3d4c = d3*d4c;
 const int d3d4b = d3*d4b;
 const int d4c_half = (d4c+1)/2;
-const int part = 16; // power of 2
+//const int part = 16; // power of 2
+#define  part 16 // power of 2
 const int part_1 = part - 1;
 const int d4c_part = (d4c + part_1)/part;
 
@@ -175,61 +176,45 @@ __global__ void mm4d_gpu_mode3_pr(float* a, float* b, float* c, int* dilation, i
 }
 
 template <int valid_idx>
-__device__ void small_exceptions(int idx_a_base, int idx, int warp_id, int d4a, float *a, float *b, float *c_idx, int idx_b_base) {
-	int k_warp, k, p, offset;
+inline __device__ void small_exceptions(int idx_a_base, int idx, int warp_id, int d4a, float *a, float *b, float *sum, int idx_b_base) {
 	float aa, bb;
 	int idx_b;
-	float sum[part] = {0.0f};
 	unsigned mask;
-	for (k = warp_id; k < d4a ; k += 32) {
+	for (int k = warp_id; k < d4a ; k += 32) {
 		aa = __ldg(&a[idx_a_base + k]);
-		for (p = valid_idx; p < part; p++) {
+		for (int p = valid_idx; p < part; p++) {
 			idx_b = idx_b_base + p*768 + k;
 			bb = __ldg(&b[idx_b]);
 			sum[p] += aa * bb;
 		}
 	}
-	__syncwarp ();
 
-	for (offset = 16; offset > 0; offset /= 2) {
+	for (int offset = 16; offset > 0; offset /= 2) {
 		mask = (1 << 2*offset) - 1;
-		for (p = valid_idx; p < part; p++) {
+		for (int p = valid_idx; p < part; p++) {
 			sum[p] += __shfl_xor_sync(mask, sum[p], offset, 2*offset);
-		}
-	}
-	if (warp_id == 0) {
-		for (p = valid_idx; p < part; p++) {
-			c_idx[p] = sum[p];
 		}
 	}
 }
 
 template <int valid_idx>
-__device__ void big_exceptions(int idx_a_base, int idx, int warp_id, int d4a, float *a, float *b, float *c_idx, int idx_b_base) {
-	int k_warp, k, p, offset;
+inline __device__ void big_exceptions(int idx_a_base, int idx, int warp_id, int d4a, float *a, float *b, float *sum, int idx_b_base) {
 	float aa, bb;
 	int idx_b;
-	float sum[part] = {0.0f};
 	unsigned mask;
-	for (k = 0; (k+warp_id) < d4a ; k += 32) {
-		k_warp = k + warp_id;
-		aa = __ldg(&a[idx_a_base + k_warp]);
-		for (p = 0; p < valid_idx; p++) {
-			idx_b = idx_b_base + p*768 + k_warp;
+	for (int k = warp_id; k < d4a ; k += 32) {
+		aa = __ldg(&a[idx_a_base + k]);
+		for (int p = 0; p < valid_idx; p++) {
+			idx_b = idx_b_base + p*768 + k;
 			bb = __ldg(&b[idx_b]);
 			sum[p] += aa * bb;
 		}
 	}
 
-	for (offset = 16; offset > 0; offset /= 2) {
+	for (int offset = 16; offset > 0; offset /= 2) {
 		mask = (1 << 2*offset) - 1;
-		for (p = 0; p < valid_idx; p++) {
+		for (int p = 0; p < valid_idx; p++) {
 			sum[p] += __shfl_xor_sync(mask, sum[p], offset, 2*offset);
-		}
-	}
-	if (warp_id == 0) {
-		for (p = 0; p < valid_idx; p++) {
-			c_idx[p] = sum[p];
 		}
 	}
 }
@@ -276,32 +261,29 @@ __global__ void mm4d_gpu_mode3_c_padz_new(float* a, float* b, float* c, int* dil
 	if (d4c_label == 3) {
 		float sum[part] = {0.0f};
 		float aa, bb;
-		int k, k_warp, offset;
 		unsigned mask;
-		for (k = 0; (k+warp_id) < d4a ; k += 32) {
-			k_warp = k + warp_id;
-			aa = __ldg(&a[idx_a_base + k_warp]);
+		for (int k = warp_id; k < d4a ; k += 32) {
+			aa = __ldg(&a[idx_a_base + k]);
 			for (p = 0; p < part; p++) {
-				bb = __ldg(&b[idx_b_base + p*idx_diff + k_warp]);
+				bb = __ldg(&b[idx_b_base + p*idx_diff + k]);
 				sum[p] += aa * bb;
 			}
 		}
-		__syncwarp ();
 
-		for (offset = 16; offset > 0; offset /= 2) {
+		for (int offset = 16; offset > 0; offset /= 2) {
 			mask = (1 << 2*offset) - 1;
-			for (p = 0; p < part; p++) {
+			for (int p = 0; p < part; p++) {
 				sum[p] += __shfl_xor_sync(mask, sum[p], offset, 2*offset);
 			}
 		}
 		if (warp_id == 0) {
-			for (p = 0; p < part; p++) {
+			for (int p = 0; p < part; p++) {
 				c[idx + p] = sum[p];
 			}
 		}
 	}
 	else if (d4c_label == 2) {
-		float c_idx[part];
+		float c_idx[part] = {0.0f};
 		switch (valid_idx) {
 			case 1: big_exceptions<1> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
 			case 2: big_exceptions<2> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
@@ -343,7 +325,7 @@ __global__ void mm4d_gpu_mode3_c_padz_new(float* a, float* b, float* c, int* dil
 		}
 	}
 	else if (d4c_label == 1) {
-		float c_idx[part];
+		float c_idx[part] = {0.0f};
 		switch (valid_idx) {
 			case 1: small_exceptions<1> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
 			case 2: small_exceptions<2> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
@@ -379,7 +361,6 @@ __global__ void mm4d_gpu_mode3_c_padz_new(float* a, float* b, float* c, int* dil
 			default: break;
 		}
 		if (warp_id == 0) {
-			printf("");
 			for (p = valid_idx; p < part; p++) {
 				c[idx + p] = c_idx[p];
 			}
