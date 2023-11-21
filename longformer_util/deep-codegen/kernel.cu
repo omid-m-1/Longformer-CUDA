@@ -14,6 +14,9 @@
 #include <stdexcept>
 
 //Matrix A: input features/attention scores/gradients of enwik8/text8, 4 dimension: d1, d2, d3 and d4
+#include <stdio.h>
+#include "wtime.h"
+
 //Matrix B: it can be input features/values/gradients, 4 dimensions
 //Matrix C: Output result : attention scores/weighted sum/gradients
 //Matrix D: Dilation information: 1 dimension = vector of heads
@@ -43,9 +46,16 @@ const int d2d3d4c = d2*d3*d4c;
 const int d3d4c = d3*d4c;
 const int d3d4b = d3*d4b;
 const int d4c_half = (d4c+1)/2;
-const int part = 16; // power of 2
+//const int part = 16; // power of 2
+#define  part 16 // power of 2
 const int part_1 = part - 1;
 const int d4c_part = (d4c + part_1)/part;
+
+__device__ inline float warp_reduce(float val){
+    for(int offset = 16; offset > 0; offset /= 2)
+        val+= __shfl_down_sync (FULL_WARP_MASK,val,offset);
+    return val;
+}
 
 __global__ void mm4d_gpu_mode1_c_padz(float* a, float* b, float* c, int* dilation, int Window, int Padding, int d2, int d3, int d4a, int d4b, int d4c, int aSize, int bSize, int cSize) {
 	int idx_a, idx_b, idx;
@@ -134,68 +144,86 @@ __global__ void mm4d_gpu_mode3_c_padz_old(float* a, float* b, float* c, int* dil
 	c[idx] = sum;
 }
 
+//Newly written, very slow
+__global__ void mm4d_gpu_mode3_pr(float* a, float* b, float* c, int* dilation, int Window, int Padding) {
+	int idx_a, idx_b;
+	int l, i, q, j, D;
+	int condition, k, ld2, idx_a_base;
+	float sum = 0.0f;
+    
+    int tid = threadIdx.x;
+	int warp_id =  blockIdx.x * 4 + threadIdx.y; 
+	if (warp_id >= cSize) return;
+
+	i = (warp_id / d3d4c) % d2;
+	q = (warp_id / d4c) % d3;
+	j = warp_id % d4c;
+	D = dilation[q];
+	condition = i + D * (j - Window);
+	if (condition < 0 || condition >= d2) return;
+	l = warp_id / d2d3d4c;
+	ld2 = l * d2;
+	idx_a_base = ((ld2 + i) * d3 + q) * d4a;
+    
+	for (k = tid; k < d4a; k += 32) {
+		idx_a = idx_a_base + k;
+		idx_b = ((ld2 + condition) * d3 + q) * d4b + k;
+		sum += a[idx_a] * b[idx_b];
+	}
+    sum = warp_reduce(sum);
+	if (tid == 0) c[warp_id] = sum;
+    
+}
+
 template <int valid_idx>
-__device__ void small_exceptions(int idx_a_base, int idx, int warp_id, int d4a, float *a, float *b, float *c_idx, int *idx_b_base) {
-	int k_warp, k, p, offset;
+inline __device__ void small_exceptions(int idx_a_base, int idx, int warp_id, int d4a, float *a, float *b, float *sum, int idx_b_base) {
 	float aa, bb;
-	int idx_b[part];
-	float sum[part] = {0.0f};
+	int idx_b;
 	unsigned mask;
-	for (k = warp_id; k < d4a ; k += 32) {
+	for (int k = warp_id; k < d4a ; k += 32) {
 		aa = __ldg(&a[idx_a_base + k]);
-		for (p = valid_idx; p < part; p++) {
-			idx_b[p] = idx_b_base[p] + k;
-			bb = __ldg(&b[idx_b[p]]);
+		for (int p = valid_idx; p < part; p++) {
+			idx_b = idx_b_base + p*768 + k;
+			bb = __ldg(&b[idx_b]);
 			sum[p] += aa * bb;
 		}
 	}
-	__syncwarp ();
 
-	for (offset = 16; offset > 0; offset /= 2) {
+	for (int offset = 16; offset > 0; offset /= 2) {
 		mask = (1 << 2*offset) - 1;
-		for (p = valid_idx; p < part; p++) {
+		for (int p = valid_idx; p < part; p++) {
 			sum[p] += __shfl_xor_sync(mask, sum[p], offset, 2*offset);
-		}
-	}
-	if (warp_id == 0) {
-		for (p = valid_idx; p < part; p++) {
-			c_idx[p] = sum[p];
 		}
 	}
 }
 
 template <int valid_idx>
-__device__ void big_exceptions(int idx_a_base, int idx, int warp_id, int d4a, float *a, float *b, float *c_idx, int *idx_b_base) {
-	int k_warp, k, p, offset;
+inline __device__ void big_exceptions(int idx_a_base, int idx, int warp_id, int d4a, float *a, float *b, float *sum, int idx_b_base) {
 	float aa, bb;
-	int idx_b[part];
-	float sum[part] = {0.0f};
+	int idx_b;
 	unsigned mask;
-	for (k = 0; (k+warp_id) < d4a ; k += 32) {
-		k_warp = k + warp_id;
-		aa = __ldg(&a[idx_a_base + k_warp]);
-		for (p = 0; p < valid_idx; p++) {
-			idx_b[p] = idx_b_base[p] + k_warp;
-			bb = __ldg(&b[idx_b[p]]);
+	for (int k = warp_id; k < d4a ; k += 32) {
+		aa = __ldg(&a[idx_a_base + k]);
+		for (int p = 0; p < valid_idx; p++) {
+			idx_b = idx_b_base + p*768 + k;
+			bb = __ldg(&b[idx_b]);
 			sum[p] += aa * bb;
 		}
 	}
 
-	for (offset = 16; offset > 0; offset /= 2) {
+	for (int offset = 16; offset > 0; offset /= 2) {
 		mask = (1 << 2*offset) - 1;
-		for (p = 0; p < valid_idx; p++) {
+		for (int p = 0; p < valid_idx; p++) {
 			sum[p] += __shfl_xor_sync(mask, sum[p], offset, 2*offset);
-		}
-	}
-	if (warp_id == 0) {
-		for (p = 0; p < valid_idx; p++) {
-			c_idx[p] = sum[p];
 		}
 	}
 }
 
 __global__ void mm4d_gpu_mode3_c_padz_new(float* a, float* b, float* c, int* dilation, int Window, int Padding) {
 	int idx, idx_warp, d4c_idx;
+	int i, q, j_first, j_last, D;
+	int d4c_label;
+	int condition_first, condition_last;
 	idx_warp = ((blockIdx.y*gridDim.x + blockIdx.x)*blockDim.x*blockDim.y + threadIdx.y*blockDim.x + threadIdx.x);
 	idx = idx_warp/32;
 	d4c_idx = idx/d4c_part;
@@ -203,9 +231,6 @@ __global__ void mm4d_gpu_mode3_c_padz_new(float* a, float* b, float* c, int* dil
 	idx = d4c_idx + (idx % d4c_part)*part;
 	if (idx >= cSize) return;
 
-	int i, q, j_first, j_last, D;
-	int d4c_label;
-	int condition_first, condition_last;
 
 	int warp_id = idx_warp%32;
 	i = (idx / d3d4c) % d2;
@@ -214,7 +239,7 @@ __global__ void mm4d_gpu_mode3_c_padz_new(float* a, float* b, float* c, int* dil
 	j_first = idx % d4c;
 	condition_first = i + D * (j_first - Window);
 	condition_last = condition_first + part_1 * D;
-	if (condition_last < 0 || condition_first >= d2) return;
+    if (condition_last < 0 || condition_first >= d2) return;
 	j_last = j_first + part_1;
 	int valid_idx;
 
@@ -222,48 +247,43 @@ __global__ void mm4d_gpu_mode3_c_padz_new(float* a, float* b, float* c, int* dil
 		if (condition_first >= 0 && condition_last < d2) {d4c_label = 3;}
 		else if (condition_last < d2) {d4c_label = 1; valid_idx = -1*((condition_first + 1 - D)/D);}
 		else {d4c_label = 2, valid_idx = (d2 - condition_first + D - 1)/D;}
-	}
-	else {d4c_label = 2; valid_idx = d4c - j_first;}
+	} else {
+        d4c_label = 2; valid_idx = d4c - j_first;
+    }
 	int l = idx / d2d3d4c;
 	int ld2 = l * d2;
 	int idx_a_base = ((ld2 + i) * d3 + q) * d4a;
-	int idx_b_base[part];
-	idx_b_base[0] = ((ld2 + condition_first) * d3 + q) * d4b;
+	int idx_b_base = ((ld2 + condition_first) * d3 + q) * d4b;
 	int idx_diff = D * d3d4b;
 	int p;
-	for (p = 1; p < part; p++) {
-		idx_b_base[p] = idx_b_base[p-1] + idx_diff;
-	}
+    //if (idx < 513 && idx > 513 + 256) printf("%d %d %d %d %d %d\n", idx_warp, j_first, condition_first, condition_last, idx_diff, Window);
 
 	if (d4c_label == 3) {
 		float sum[part] = {0.0f};
 		float aa, bb;
-		int k, k_warp, offset;
 		unsigned mask;
-		for (k = 0; (k+warp_id) < d4a ; k += 32) {
-			k_warp = k + warp_id;
-			aa = __ldg(&a[idx_a_base + k_warp]);
+		for (int k = warp_id; k < d4a ; k += 32) {
+			aa = __ldg(&a[idx_a_base + k]);
 			for (p = 0; p < part; p++) {
-				bb = __ldg(&b[idx_b_base[p] + k_warp]);
+				bb = __ldg(&b[idx_b_base + p*idx_diff + k]);
 				sum[p] += aa * bb;
 			}
 		}
-		__syncwarp ();
 
-		for (offset = 16; offset > 0; offset /= 2) {
+		for (int offset = 16; offset > 0; offset /= 2) {
 			mask = (1 << 2*offset) - 1;
-			for (p = 0; p < part; p++) {
+			for (int p = 0; p < part; p++) {
 				sum[p] += __shfl_xor_sync(mask, sum[p], offset, 2*offset);
 			}
 		}
 		if (warp_id == 0) {
-			for (p = 0; p < part; p++) {
+			for (int p = 0; p < part; p++) {
 				c[idx + p] = sum[p];
 			}
 		}
 	}
 	else if (d4c_label == 2) {
-		float c_idx[part];
+		float c_idx[part] = {0.0f};
 		switch (valid_idx) {
 			case 1: big_exceptions<1> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
 			case 2: big_exceptions<2> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
@@ -305,7 +325,7 @@ __global__ void mm4d_gpu_mode3_c_padz_new(float* a, float* b, float* c, int* dil
 		}
 	}
 	else if (d4c_label == 1) {
-		float c_idx[part];
+		float c_idx[part] = {0.0f};
 		switch (valid_idx) {
 			case 1: small_exceptions<1> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
 			case 2: small_exceptions<2> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
@@ -341,7 +361,6 @@ __global__ void mm4d_gpu_mode3_c_padz_new(float* a, float* b, float* c, int* dil
 			default: break;
 		}
 		if (warp_id == 0) {
-			printf("");
 			for (p = valid_idx; p < part; p++) {
 				c[idx + p] = c_idx[p];
 			}
@@ -758,12 +777,25 @@ void lformerMM(array4d_t<float>& input1, array4d_t<float>& input2, array4d_t<flo
 	dim3 blockSize(8, 8);
 	dim3 gridSize_c((((32 + part_1)/part)*(d1 * d2 + blockSize.x - 1) / blockSize.x) + 100, (d3 * d4c + blockSize.y - 1) / blockSize.y);
 	dim3 gridSize((d1 * d2 + blockSize.x - 1) / blockSize.x, (d3 * d4c + blockSize.y - 1) / blockSize.y);
+    dim3 blocks(32, 4);
+    dim3 grids ((d1*d2*d3*d4c + 3) /4, 1);
+    //printf("%d, %d %d, %d, %d %d %d %d %d\n", d1, d2, d3, d4a, d4b, d4c, grids.x, gridSize_c.x, gridSize_c.y);
+    //double start = mywtime();
 
 	if (d4c != d4b) { //mode3
-		if (coalesced == 1) mm4d_gpu_mode3_c_padz_new<<<gridSize_c, blockSize>>>(a, b, c, d, Window, Padding);
-		else mm4d_gpu_mode3_c_padz_old<<<gridSize, blockSize>>>(a, b, c, d, Window, Padding);
+		if (coalesced == 1) 
+            mm4d_gpu_mode3_c_padz_new<<<gridSize_c, blockSize>>>(a, b, c, d, Window, Padding);
+            //mm4d_gpu_mode3_pr<<<grids, blocks>>>(a, b, c, d, Window, Padding);
+		else 
+            mm4d_gpu_mode3_c_padz_old<<<gridSize, blockSize>>>(a, b, c, d, Window, Padding);
 	}
 	else {
 		throw std::invalid_argument("coalesced kernel for mode 1 and 2 is not implemented.");
 	}
+
+    /*
+    cudaDeviceSynchronize();
+    double end = mywtime();
+    printf("cuda time = %f\n", end - start);
+    */
 }
