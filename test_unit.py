@@ -15,7 +15,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--kernel', default='dcg', help='valid options: [tvm, dcg]')
+    parser.add_argument('--kernel', default='dcg', help='valid options: [tvm, dcg, dense]')
     parser.add_argument('--mode', type=int, default=1, help='valid options: [1, 3]')
     parser.add_argument('--input1_dimensions', type=int, nargs='+', default=None, help='enter four digits')
     parser.add_argument('--input2_dimensions', type=int, nargs='+', default=None, help='enter four digits')
@@ -32,7 +32,7 @@ if __name__ == '__main__':
     input1_dimensions = args.input1_dimensions
     input2_dimensions = args.input2_dimensions
     dilation = args.dilation
-    window = args.window
+    window = args.window if (kernel != 'dense') else default_input1[1]
     padding = args.padding
     autoregressive = args.autoregressive
     window_upper = 0 if autoregressive else window
@@ -76,8 +76,10 @@ if __name__ == '__main__':
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
         if kernel == 'dcg':
             output1 = lformerMM(input1, input2, window, dilation, is_diagonal, padding, autoregressive, coalesced)
-        else:
+        elif kernel == 'tvm':
             output1 = diagonaled_mm(input1, input2, window, dilation, is_diagonal, padding, autoregressive)
+        else:
+            if (mode ==3): output1 = torch.einsum('bxcd,bycd->bxcy', (input1, input2))
         random_target = torch.rand_like(output1, device=device)
         #loss = (output1 - random_target).pow(2).mean()
         #loss.backward()
@@ -87,6 +89,7 @@ if __name__ == '__main__':
         output2 = diagonaled_mm(input1, input2, window, dilation, is_diagonal, padding, autoregressive)
         print("dcg", output1)
         print("tvm", output2)
+        print(output1.shape, output2.shape)
         loss = (output1 - output2).pow(2).mean()
         if loss < (10 ** -6): print('dcg and tvm outputs are matched')
         else: print('dcg and tvm outputs are not matched')
