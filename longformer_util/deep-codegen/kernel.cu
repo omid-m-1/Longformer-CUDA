@@ -65,18 +65,23 @@ const int coef_b = -1 * d3 * min_valid_part * (Dmin2_part + 1); // ai^2 + bi + c
 const int coef_c1 = d3 * (Dmin * Dmin_part + 2 * Dmin -  Dmin * Dmin);
 const int d3_d4c_part = d3 * d4c_part;
 
+const int invalid_idx_last = d2 - Dmin * Window;
+const int coef_b_last = -1 * d3 * Dmin_part * (2 * d4c_part - 1);
+const int coef_a_last = -1 * d3 * Dmin_part;
+const int i_last_part = Window / part;
+
 __device__ inline float warp_reduce(float val){
     for(int offset = 16; offset > 0; offset /= 2)
         val+= __shfl_down_sync (FULL_WARP_MASK,val,offset);
     return val;
 }
 
-void compute_half1_invalid_idx(int* valid_j, int* start_i, int *l_size) {
+void compute_half1_invalid_idx(int* valid_j, int* start_i, int* start_i_last, int* l_size, int* i_last) {
 	int i_minusD, i_part, idx_part;
-	for (int i = 0; i < invalid_idx+1; i++) {
+	for (int i = 0; i < invalid_idx + 1; i++) {
 		if (i >= Dmin) {
-			i_minusD = i-Dmin;
-			i_part = i_minusD/Dmin_part;
+			i_minusD = i - Dmin;
+			i_part = i_minusD / Dmin_part;
 			idx_part = i_part * Dmin_part;
 			valid_j[i] = min_valid_part + i_part + 1;
 			start_i[i] = d3 * (min_valid_part * i + ((idx_part * (idx_part + Dmin_minus2_part)) / Dmin2_part) + ((i_minusD % Dmin_part) * i_part) + i_minusD - i_part);
@@ -86,7 +91,11 @@ void compute_half1_invalid_idx(int* valid_j, int* start_i, int *l_size) {
 			start_i[i] = d3 * min_valid_part * i;
 		}
 	}
-	*l_size = (d2 - invalid_idx) * d3_d4c_part + start_i[invalid_idx];
+	*i_last = (invalid_idx_last - invalid_idx) * d3 * d4c_part + start_i[invalid_idx];
+	*l_size = *i_last + Dmin_part * d3 * ((d4c_part - 1) * i_last_part - (i_last_part * (i_last_part - 1))/2);
+	for (int i = 0; i < i_last_part; i++) {
+		start_i_last[i] = Dmin_part * d3 * ((d4c_part - 1) * i - (i * (i - 1))/2);
+	}
 }
 
 __global__ void mm4d_gpu_mode1_c_padz(float* a, float* b, float* c, int* dilation, int Window, int Padding, int d2, int d3, int d4a, int d4b, int d4c, int aSize, int bSize, int cSize) {
@@ -221,7 +230,7 @@ inline __device__ void big_exceptions(int idx_a_base, int idx, int warp_id, int 
 	}
 }
 
-__global__ void mm4d_gpu_mode3_c_padz_new(float* a, float* b, float* c, int* dilation, int* valid_j, int* start_i, int l_size) {
+__global__ void mm4d_gpu_mode3_c_padz_new(float* a, float* b, float* c, int* dilation, int* valid_j, int* start_i, int* start_i_last, int l_size, int i_last) {
   int idx, idx_warp;
   idx_warp = ((blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x * blockDim.y + threadIdx.y * blockDim.x + threadIdx.x);
   idx = idx_warp/32;
@@ -231,18 +240,29 @@ __global__ void mm4d_gpu_mode3_c_padz_new(float* a, float* b, float* c, int* dil
 
   int remaining_l = idx % l_size;
   int remaining_start = remaining_l - start_i[invalid_idx];
+  int remaining_end = remaining_l - i_last;
 
-  if (remaining_start >= 0) {
+  if (remaining_start >= 0 && remaining_end < 0) {
     i = remaining_start / d3_d4c_part + invalid_idx;
     q = (remaining_start / d4c_part) % d3;
     j_first = (remaining_start % d4c_part) * part;
+  }
+
+  else if (remaining_end >= 0) {
+    int i_part = (coef_b_last + sqrtf(coef_b_last * coef_b_last + 8 * coef_a_last * remaining_end)) / (2 * coef_a_last);
+    int valid_j_last = d4c_part - 1 - i_part;
+    // remaining_end -= d3 * Dmin_part * ((d4c_part - 1) * i_part - (i_part * (i_part - 1))/2);
+    remaining_end -= start_i_last[i_part];
+    i = invalid_idx_last + i_part * Dmin_part + remaining_end / (d3 * valid_j_last);
+    q = (remaining_end / valid_j_last) % d3;
+    j_first = (remaining_end % valid_j_last) * part;
   }
 
   else if (remaining_l >= Dmin * d3 * valid_j[0]) {
     i = (coef_b + sqrtf(coef_b * coef_b + 4 * d3 * (coef_c1 + Dmin2_part * remaining_l)))/(2 * d3);
 
     remaining_start = remaining_l - start_i[i];
-    int remaining_end = remaining_l - start_i[i+1];
+    remaining_end = remaining_l - start_i[i+1];
 
     if (remaining_start < 0) {i = i - 1; remaining_start = remaining_l - start_i[i];}
     else if (remaining_end >= 0) {i = i + 1; remaining_start = remaining_l - start_i[i];}
@@ -800,26 +820,29 @@ void lformerMM(array4d_t<float>& input1, array4d_t<float>& input2, array4d_t<flo
 	int Window = params.data_ptr[0], WindowUpper = params.data_ptr[1], Padding = params.data_ptr[2], transposeT1 = params.data_ptr[3], coalesced = params.data_ptr[4];
 	//printf("params: %d %d %d %d %d\n", Window, WindowUpper, Padding, transposeT1, coalesced);
 
-  int *valid_j = (int *)malloc((invalid_idx +1) * sizeof(int));  // valid_j : valid numbers of j
+	int *valid_j = (int *)malloc((invalid_idx +1) * sizeof(int));  // valid_j : valid numbers of j
 	int *start_i = (int *)malloc((invalid_idx +1) * sizeof(int));  // start_i : index of first element
-	int *v_j, *s_i, l_size; // l_size: valid elements in i, q, j
-  cudaMalloc(&v_j, (invalid_idx +1) * sizeof(int));
+	int *start_i_last = (int *)malloc(i_last_part * sizeof(int));
+	int *v_j, *s_i, *s_i_l, l_size, i_last; // l_size: valid elements in i, q, j
+	cudaMalloc(&v_j, (invalid_idx +1) * sizeof(int));
 	cudaMalloc(&s_i, (invalid_idx +1) * sizeof(int));
-  compute_half1_invalid_idx(valid_j, start_i, &l_size);
-  cudaMemcpy(v_j, valid_j, (invalid_idx +1) * sizeof(int), cudaMemcpyHostToDevice);
+	cudaMalloc(&s_i_l, i_last_part * sizeof(int));
+	compute_half1_invalid_idx(valid_j, start_i, start_i_last, &l_size, &i_last);
+	cudaMemcpy(v_j, valid_j, (invalid_idx +1) * sizeof(int), cudaMemcpyHostToDevice);
 	cudaMemcpy(s_i, start_i, (invalid_idx +1) * sizeof(int), cudaMemcpyHostToDevice);
+	cudaMemcpy(s_i_l, start_i_last, i_last_part * sizeof(int), cudaMemcpyHostToDevice);
 
 	dim3 blockSize(8, 8);
-	dim3 gridSize_c((((32 + part_1)/part)*(d1 * d2 + blockSize.x - 1) / blockSize.x) + 30, (d3 * d4c + blockSize.y - 1) / blockSize.y);
+	dim3 gridSize_c((((32 + part_1)/part)*(d1 * d2 + blockSize.x - 1) / blockSize.x), (d3 * d4c + blockSize.y - 1) / blockSize.y);
 	dim3 gridSize((d1 * d2 + blockSize.x - 1) / blockSize.x, (d3 * d4c + blockSize.y - 1) / blockSize.y);
-    dim3 blocks(32, 4);
-    dim3 grids ((d1*d2*d3*d4c + 3) /4, 1);
-    //printf("%d, %d %d, %d, %d %d %d %d %d\n", d1, d2, d3, d4a, d4b, d4c, grids.x, gridSize_c.x, gridSize_c.y);
-    //double start = mywtime();
+	dim3 blocks(32, 4);
+	dim3 grids ((d1*d2*d3*d4c + 3) /4, 1);
+	//printf("%d, %d %d, %d, %d %d %d %d %d\n", d1, d2, d3, d4a, d4b, d4c, grids.x, gridSize_c.x, gridSize_c.y);
+	//double start = mywtime();
 
 	if (d4c != d4b) { //mode3
 		if (coalesced == 1)
-            mm4d_gpu_mode3_c_padz_new<<<gridSize_c, blockSize>>>(a, b, c, d, v_j, s_i, l_size);
+            mm4d_gpu_mode3_c_padz_new<<<gridSize_c, blockSize>>>(a, b, c, d, v_j, s_i, s_i_l, l_size, i_last);
             //mm4d_gpu_mode3_pr<<<grids, blocks>>>(a, b, c, d, Window, Padding);
 		else
             mm4d_gpu_mode3_c_padz_old<<<gridSize, blockSize>>>(a, b, c, d);
@@ -828,11 +851,11 @@ void lformerMM(array4d_t<float>& input1, array4d_t<float>& input2, array4d_t<flo
 		throw std::invalid_argument("coalesced kernel for mode 1 and 2 is not implemented.");
 	}
 
-    /*
-    cudaDeviceSynchronize();
-    double end = mywtime();
-    printf("cuda time = %f\n", end - start);
-    */
-    cudaFree(s_i); cudaFree(v_j);
-    delete[] start_i; delete[] valid_j;
+	/*
+ 	cudaDeviceSynchronize();
+	double end = mywtime();
+	printf("cuda time = %f\n", end - start);
+	*/
+	cudaFree(s_i); cudaFree(s_i_l); cudaFree(v_j);
+	delete[] start_i; delete[] start_i_last, delete[] valid_j;
 }
