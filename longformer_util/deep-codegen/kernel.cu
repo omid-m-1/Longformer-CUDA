@@ -73,14 +73,21 @@ const int i_last_part = Window / part;
 
 __device__ inline float warp_reduce(float val){
     for(int offset = 16; offset > 0; offset /= 2)
-        val+= __shfl_down_sync (FULL_WARP_MASK,val,offset);
+        val+= __shfl_xor_sync (FULL_WARP_MASK,val,offset);
     return val;
 }
 
 __device__ inline float warp_reduce(float2 val1){
     float val = val1.x +  val1.y;
     for(int offset = 16; offset > 0; offset /= 2)
-        val+= __shfl_down_sync (FULL_WARP_MASK,val,offset);
+        val+= __shfl_xor_sync (FULL_WARP_MASK,val,offset);
+    return val;
+}
+
+template <int dim_wcount>
+__device__ inline float subwarp_reduce(float val){
+    for(int offset = 16/dim_wcount; offset > 0; offset /= 2)
+        val+= __shfl_down_sync (FULL_WARP_MASK,val,offset, 16);
     return val;
 }
 
@@ -268,7 +275,7 @@ __global__ void mm4d_gpu_mode3_pr3(float* a, float* b, float* c, int* dilation, 
 //data-reuse across i dimension
 __global__ void mm4d_gpu_mode3_pr4(float* a, float* b, float* c, int* dilation, int Window, int Padding) {
 	int l, i, q, j, D;
-	int k, ld2;
+	int ld2;
 
     /*
     threadIdx.y = [0, 4)     => 4 i
@@ -290,19 +297,27 @@ __global__ void mm4d_gpu_mode3_pr4(float* a, float* b, float* c, int* dilation, 
 
     int j_upper = min(j+part, d4c);
     int idx_a = ((ld2 + i) * d3 + q) * d4a;
-    float2 a_value = ((float2*)(a + idx_a))[tid];
+    
+    int dim_wid = tid / 16;
+    int dim_tid = tid % 16;
+    float4 a_value = ((float4*)(a + idx_a))[dim_tid];
+    
+    for (int jj = j + dim_wid; jj < j_upper; jj += 2) {
+	    int condition = (i + D * (jj - Window));
+	    float4 b_value; 
+        if (condition >= 0 && condition < d2) {
+            int idx_b = ((ld2 + condition) * d3 + q) * d4b;
+            b_value = ((float4*)(b + idx_b))[dim_tid];
+        }
+        
+        float4 sum  = a_value * b_value;
+        float  dot  = sum.x + sum.y + sum.z + sum.w;
+        dot         = subwarp_reduce<2>(dot);
 
-    for (; j < j_upper; ++j) {
-	    int condition = (i + D * (j - Window));
-	    if (condition < 0 || condition >= d2) continue;
-        
-        int idx_b = ((ld2 + condition) * d3 + q) * d4b;
-        
-        float2 b_value = ((float2*)(b + idx_b))[tid];
-        float2 sum     = a_value * b_value;
-        
-        sum.x = warp_reduce(sum);
-        if (tid == 0) c[((ld2 + i) * d3 + q) * d4c + j] = sum.x;
+	    if (condition >= 0 && condition < d2) {
+            int index = ((ld2 + i)*d3 + q)*d4c + jj;
+            if (dim_tid == 0) c[index] = dot;
+        }
     }
 }
 
@@ -940,8 +955,10 @@ void lformerMM(array4d_t<float>& input1, array4d_t<float>& input2, array4d_t<flo
     float* b = input2.data_ptr;
     float* c = output1.data_ptr;
 	int Window = params.data_ptr[0], WindowUpper = params.data_ptr[1], Padding = params.data_ptr[2], transposeT1 = params.data_ptr[3], coalesced = params.data_ptr[4];
-	printf("params: %d %d %d %d %d\n", Window, WindowUpper, Padding, transposeT1, coalesced);
+	
+    //printf("params: %d %d %d %d %d\n", Window, WindowUpper, Padding, transposeT1, coalesced);
 
+    /*
 	int *valid_j = (int *)malloc((invalid_idx +1) * sizeof(int));  // valid_j : valid numbers of j
 	int *start_i = (int *)malloc((invalid_idx +1) * sizeof(int));  // start_i : index of first element
 	int *start_i_last = (int *)malloc(i_last_part * sizeof(int));
@@ -955,6 +972,7 @@ void lformerMM(array4d_t<float>& input1, array4d_t<float>& input2, array4d_t<flo
 	cudaMemcpy(v_j, valid_j, (invalid_idx +1) * sizeof(int), cudaMemcpyHostToDevice);
 	cudaMemcpy(s_i, start_i, (invalid_idx +1) * sizeof(int), cudaMemcpyHostToDevice);
 	cudaMemcpy(s_i_l, start_i_last, i_last_part * sizeof(int), cudaMemcpyHostToDevice);
+    */
 
 	dim3 blockSize(8, 8);
 	dim3 gridSize((d1 * d2 + blockSize.x - 1) / blockSize.x, (d3 * d4c + blockSize.y - 1) / blockSize.y);
@@ -969,8 +987,8 @@ void lformerMM(array4d_t<float>& input1, array4d_t<float>& input2, array4d_t<flo
 
 	if (d4c != d4b) { //mode3
 		if (coalesced == 1)
-            mm4d_gpu_mode3_c_padz_new<<<gridSize_c, blocks>>>(a, b, c, d, v_j, s_i, s_i_l, l_size, i_last);
-            //mm4d_gpu_mode3_pr4<<<grids, blocks>>>(a, b, c, d, Window, Padding);
+            //mm4d_gpu_mode3_c_padz_new<<<gridSize_c, blocks>>>(a, b, c, d, v_j, s_i, s_i_l, l_size, i_last);
+            mm4d_gpu_mode3_pr4<<<grids, blocks>>>(a, b, c, d, Window, Padding);
 		else
             mm4d_gpu_mode3_c_padz_old<<<gridSize, blockSize>>>(a, b, c, d);
 	}
@@ -982,7 +1000,7 @@ void lformerMM(array4d_t<float>& input1, array4d_t<float>& input2, array4d_t<flo
  	cudaDeviceSynchronize();
 	double end = mywtime();
 	printf("cuda time = %f\n", end - start);
-    */
 	cudaFree(s_i); cudaFree(s_i_l); cudaFree(v_j);
 	delete[] start_i; delete[] start_i_last, delete[] valid_j;
+    */
 }
