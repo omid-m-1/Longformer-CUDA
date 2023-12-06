@@ -16,6 +16,7 @@
 //Matrix A: input features/attention scores/gradients of enwik8/text8, 4 dimension: d1, d2, d3 and d4
 #include <stdio.h>
 #include "wtime.h"
+#include "helper_math.h"
 
 //Matrix B: it can be input features/values/gradients, 4 dimensions
 //Matrix C: Output result : attention scores/weighted sum/gradients
@@ -76,6 +77,13 @@ __device__ inline float warp_reduce(float val){
     return val;
 }
 
+__device__ inline float warp_reduce(float2 val1){
+    float val = val1.x +  val1.y;
+    for(int offset = 16; offset > 0; offset /= 2)
+        val+= __shfl_down_sync (FULL_WARP_MASK,val,offset);
+    return val;
+}
+
 void compute_half1_invalid_idx(int* valid_j, int* start_i, int* start_i_last, int* l_size, int* i_last) {
 	int i_minusD, i_part, idx_part;
 	for (int i = 0; i < invalid_idx + 1; i++) {
@@ -90,12 +98,16 @@ void compute_half1_invalid_idx(int* valid_j, int* start_i, int* start_i_last, in
 			valid_j[i] = min_valid_part;
 			start_i[i] = d3 * min_valid_part * i;
 		}
+        //printf("%d: %d %d\n", i, valid_j[i], start_i[i]);
 	}
 	*i_last = (invalid_idx_last - invalid_idx) * d3 * d4c_part + start_i[invalid_idx];
 	*l_size = *i_last + Dmin_part * d3 * ((d4c_part - 1) * i_last_part - (i_last_part * (i_last_part - 1))/2);
 	for (int i = 0; i < i_last_part; i++) {
 		start_i_last[i] = Dmin_part * d3 * ((d4c_part - 1) * i - (i * (i - 1))/2);
+        //printf("%d: %d\n", i, start_i_last[i]);
 	}
+        
+    //printf("%d %d\n", *i_last, *l_size);
 }
 
 __global__ void mm4d_gpu_mode1_c_padz(float* a, float* b, float* c, int* dilation, int Window, int Padding, int d2, int d3, int d4a, int d4b, int d4c, int aSize, int bSize, int cSize) {
@@ -157,41 +169,149 @@ __global__ void mm4d_gpu_mode3_c_padz_old(float* a, float* b, float* c, int* dil
 
 //Newly written, very slow
 __global__ void mm4d_gpu_mode3_pr(float* a, float* b, float* c, int* dilation, int Window, int Padding) {
-	int idx_a, idx_b;
 	int l, i, q, j, D;
-	int condition, k, ld2, idx_a_base;
-	float sum = 0.0f;
+	int k, ld2;
 
     int tid = threadIdx.x;
 	int warp_id =  blockIdx.x * 4 + threadIdx.y;
 	if (warp_id >= cSize) return;
 
-	i = (warp_id / d3d4c) % d2;
-	q = (warp_id / d4c) % d3;
-	j = warp_id % d4c;
+	i = (warp_id / d3d4c) % d2;//which token sequence
+	q = (warp_id / d4c) % d3; //which head
+	j = warp_id % d4c;   //which attention result
 	D = dilation[q];
-	condition = i + D * (j - Window);
+
+	int condition = i + D * (j - Window);
 	if (condition < 0 || condition >= d2) return;
+
 	l = warp_id / d2d3d4c;
 	ld2 = l * d2;
-	idx_a_base = ((ld2 + i) * d3 + q) * d4a;
+	
+    int idx_a = ((ld2 + i) * d3 + q) * d4a;
+    int idx_b = ((ld2 + condition) * d3 + q) * d4b;
+    
+    float2 a_value = ((float2*)(a + idx_a))[tid];
+    float2 b_value = ((float2*)(b + idx_b))[tid];
+    float2 sum     = a_value * b_value;
+    
+    sum.x = warp_reduce(sum);
+	if (tid == 0) c[warp_id] = sum.x;
+}
 
-	for (k = tid; k < d4a; k += 32) {
-		idx_a = idx_a_base + k;
-		idx_b = ((ld2 + condition) * d3 + q) * d4b + k;
-		sum += a[idx_a] * b[idx_b];
-	}
-    sum = warp_reduce(sum);
-	if (tid == 0) c[warp_id] = sum;
+__global__ void mm4d_gpu_mode3_pr2(float* a, float* b, float* c, int* dilation, int Window, int Padding) {
+	int l, i, q, j, D;
+	int k, ld2;
 
+    int tid = threadIdx.x;
+	int warp_id =  blockIdx.x * 4 + threadIdx.y;
+	if (warp_id >= cSize) return;
+
+	i = (warp_id / d4c) % d2;//which token sequence
+	q = blockIdx.y; //(warp_id / d4c) % d3; //which head
+	j = warp_id % d4c;   //which attention result
+	D = dilation[q];
+
+	int condition = i + D * (j - Window);
+	if (condition < 0 || condition >= d2) return;
+
+	l = warp_id / (d2*d4c);
+	ld2 = l * d2;
+	
+    int idx_a = ((ld2 + i) * d3 + q) * d4a;
+    int idx_b = ((ld2 + condition) * d3 + q) * d4b;
+    
+    float2 a_value = ((float2*)(a + idx_a))[tid];
+    float2 b_value = ((float2*)(b + idx_b))[tid];
+    float2 sum     = a_value * b_value;
+    
+    sum.x = warp_reduce(sum);
+    if (tid == 0) c[((ld2 + i) * d3 + q) * d4c + j] = sum.x;
+}
+
+__global__ void mm4d_gpu_mode3_pr3(float* a, float* b, float* c, int* dilation, int Window, int Padding) {
+	int l, i, q, j, D;
+	int k, ld2;
+
+    /*
+    threadIdx.y = [0, 4)     => 4 i
+    blockIdx.x = [0, 513)    => j
+    blockIdx.y = [0, 4096/4) => 4 rows (i).
+    blockIdx.z = [0, 12)     => heads
+    */
+
+    int tid = threadIdx.x;
+    int abs_i = blockIdx.y* blockDim.y + threadIdx.y; 
+
+    i = abs_i % d2; //which token sequence
+    j = blockIdx.x; //which attention result
+    q = blockIdx.z; //which head
+
+	D = dilation[q];
+
+	int condition = i + D * (j - Window);
+	if (condition < 0 || condition >= d2) return;
+
+	l = abs_i/d2; //which mini-batch
+	ld2 = l * d2;
+	
+    int idx_a = ((ld2 + i) * d3 + q) * d4a;
+    int idx_b = ((ld2 + condition) * d3 + q) * d4b;
+    
+    float2 a_value = ((float2*)(a + idx_a))[tid];
+    float2 b_value = ((float2*)(b + idx_b))[tid];
+    float2 sum     = a_value * b_value;
+    
+    sum.x = warp_reduce(sum);
+    if (tid == 0) c[((ld2 + i) * d3 + q) * d4c + j] = sum.x;
+}
+
+//data-reuse across i dimension
+__global__ void mm4d_gpu_mode3_pr4(float* a, float* b, float* c, int* dilation, int Window, int Padding) {
+	int l, i, q, j, D;
+	int k, ld2;
+
+    /*
+    threadIdx.y = [0, 4)     => 4 i
+    blockIdx.x = [0, 513)    => j
+    blockIdx.y = [0, 4096/4) => 4 rows (i).
+    blockIdx.z = [0, 12)     => heads
+    */
+
+    int tid = threadIdx.x;
+    int abs_i = blockIdx.y* blockDim.y + threadIdx.y; 
+
+    i = abs_i % d2; //which token sequence
+	l = abs_i/d2; //which mini-batch
+	ld2 = l * d2;
+    j = blockIdx.x*part; //which attention result
+    q = blockIdx.z; //which head
+
+	D = dilation[q];
+
+    int j_upper = min(j+part, d4c);
+    int idx_a = ((ld2 + i) * d3 + q) * d4a;
+    float2 a_value = ((float2*)(a + idx_a))[tid];
+
+    for (; j < j_upper; ++j) {
+	    int condition = (i + D * (j - Window));
+	    if (condition < 0 || condition >= d2) continue;
+        
+        int idx_b = ((ld2 + condition) * d3 + q) * d4b;
+        
+        float2 b_value = ((float2*)(b + idx_b))[tid];
+        float2 sum     = a_value * b_value;
+        
+        sum.x = warp_reduce(sum);
+        if (tid == 0) c[((ld2 + i) * d3 + q) * d4c + j] = sum.x;
+    }
 }
 
 template <int valid_idx>
-inline __device__ void small_exceptions(int idx_a_base, int idx, int warp_id, int d4a, float *a, float *b, float *sum, int idx_b_base) {
+inline __device__ void small_exceptions(int idx_a_base, int idx, int thd_id, int d4a, float *a, float *b, float *sum, int idx_b_base) {
 	float aa, bb;
 	int idx_b;
 	unsigned mask;
-	for (int k = warp_id; k < d4a ; k += 32) {
+	for (int k = thd_id; k < d4a ; k += 32) {
 		aa = __ldg(&a[idx_a_base + k]);
 		for (int p = valid_idx; p < part; p++) {
 			idx_b = idx_b_base + p*768 + k;
@@ -209,11 +329,11 @@ inline __device__ void small_exceptions(int idx_a_base, int idx, int warp_id, in
 }
 
 template <int valid_idx>
-inline __device__ void big_exceptions(int idx_a_base, int idx, int warp_id, int d4a, float *a, float *b, float *sum, int idx_b_base) {
+inline __device__ void big_exceptions(int idx_a_base, int idx, int thd_id, int d4a, float *a, float *b, float *sum, int idx_b_base) {
 	float aa, bb;
 	int idx_b;
 	unsigned mask;
-	for (int k = warp_id; k < d4a ; k += 32) {
+	for (int k = thd_id; k < d4a ; k += 32) {
 		aa = __ldg(&a[idx_a_base + k]);
 		for (int p = 0; p < valid_idx; p++) {
 			idx_b = idx_b_base + p*768 + k;
@@ -231,14 +351,16 @@ inline __device__ void big_exceptions(int idx_a_base, int idx, int warp_id, int 
 }
 
 __global__ void mm4d_gpu_mode3_c_padz_new(float* a, float* b, float* c, int* dilation, int* valid_j, int* start_i, int* start_i_last, int l_size, int i_last) {
-  int idx, idx_warp;
-  idx_warp = ((blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x * blockDim.y + threadIdx.y * blockDim.x + threadIdx.x);
-  idx = idx_warp/32;
+  //int idx_warp = ((blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x * blockDim.y + threadIdx.y * blockDim.x + threadIdx.x);
+  //int idx = idx_warp/32;
 
+  int thd_id = threadIdx.x;
+  int abs_warp_id = ((blockIdx.y * gridDim.x + blockIdx.x) * blockDim.y + threadIdx.y);
+  
   int l, i, q, j_first;
-  l = idx / l_size;
+  l = abs_warp_id / l_size;
 
-  int remaining_l = idx % l_size;
+  int remaining_l = abs_warp_id % l_size;
   int remaining_start = remaining_l - start_i[invalid_idx];
   int remaining_end = remaining_l - i_last;
 
@@ -246,9 +368,8 @@ __global__ void mm4d_gpu_mode3_c_padz_new(float* a, float* b, float* c, int* dil
     i = remaining_start / d3_d4c_part + invalid_idx;
     q = (remaining_start / d4c_part) % d3;
     j_first = (remaining_start % d4c_part) * part;
-  }
 
-  else if (remaining_end >= 0) {
+  } else if (remaining_end >= 0) {
     int i_part = (coef_b_last + sqrtf(coef_b_last * coef_b_last + 8 * coef_a_last * remaining_end)) / (2 * coef_a_last);
     int valid_j_last = d4c_part - 1 - i_part;
     // remaining_end -= d3 * Dmin_part * ((d4c_part - 1) * i_part - (i_part * (i_part - 1))/2);
@@ -256,9 +377,8 @@ __global__ void mm4d_gpu_mode3_c_padz_new(float* a, float* b, float* c, int* dil
     i = invalid_idx_last + i_part * Dmin_part + remaining_end / (d3 * valid_j_last);
     q = (remaining_end / valid_j_last) % d3;
     j_first = (remaining_end % valid_j_last) * part;
-  }
 
-  else if (remaining_l >= Dmin * d3 * valid_j[0]) {
+  } else if (remaining_l >= Dmin * d3 * valid_j[0]) {
     i = (coef_b + sqrtf(coef_b * coef_b + 4 * d3 * (coef_c1 + Dmin2_part * remaining_l)))/(2 * d3);
 
     remaining_start = remaining_l - start_i[i];
@@ -270,19 +390,19 @@ __global__ void mm4d_gpu_mode3_c_padz_new(float* a, float* b, float* c, int* dil
 
     q = remaining_start / valid_j[i];
     j_first = ((remaining_start % valid_j[i]) + d4c_part - valid_j[i]) * part;
-  }
-  else {
+
+  } else {
     i = remaining_l/(d3 * valid_j[0]);
     remaining_start = remaining_l - start_i[i];
 
     q = (remaining_start / valid_j[0]) % d3;
     j_first = ((remaining_start % valid_j[0]) + d4c_part - valid_j[0]) * part;
   }
-  idx = l * d2d3d4c + i * d3d4c + q * d4c + j_first;
-	if (idx >= cSize) return;
+
+  int idx = l * d2d3d4c + i * d3d4c + q * d4c + j_first;
+  if (idx >= cSize) return;
 
   int j_last, D, d4c_label, condition_first, condition_last;
-	int warp_id = idx_warp % 32;
 	D = dilation[q];
 	condition_first = i + D * (j_first - Window);
 	condition_last = condition_first + part_1 * D;
@@ -308,7 +428,7 @@ __global__ void mm4d_gpu_mode3_c_padz_new(float* a, float* b, float* c, int* dil
 		float sum[part] = {0.0f};
 		float aa, bb;
 		unsigned mask;
-		for (int k = warp_id; k < d4a ; k += 32) {
+		for (int k = thd_id; k < d4a ; k += 32) {
 			aa = __ldg(&a[idx_a_base + k]);
 			for (p = 0; p < part; p++) {
 				bb = __ldg(&b[idx_b_base + p*idx_diff + k]);
@@ -322,7 +442,7 @@ __global__ void mm4d_gpu_mode3_c_padz_new(float* a, float* b, float* c, int* dil
 				sum[p] += __shfl_xor_sync(mask, sum[p], offset, 2*offset);
 			}
 		}
-		if (warp_id == 0) {
+		if (thd_id == 0) {
 			for (int p = 0; p < part; p++) {
 				c[idx + p] = sum[p];
 			}
@@ -331,40 +451,40 @@ __global__ void mm4d_gpu_mode3_c_padz_new(float* a, float* b, float* c, int* dil
 	else if (d4c_label == 2) {
 		float c_idx[part] = {0.0f};
 		switch (valid_idx) {
-			case 1: big_exceptions<1> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 2: big_exceptions<2> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 3: big_exceptions<3> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 4: big_exceptions<4> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 5: big_exceptions<5> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 6: big_exceptions<6> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 7: big_exceptions<7> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 8: big_exceptions<8> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 9: big_exceptions<9> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 10: big_exceptions<10> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 11: big_exceptions<11> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 12: big_exceptions<12> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 13: big_exceptions<13> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 14: big_exceptions<14> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 15: big_exceptions<15> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 16: big_exceptions<16> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 17: big_exceptions<17> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 18: big_exceptions<18> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 19: big_exceptions<19> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 20: big_exceptions<20> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 21: big_exceptions<21> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 22: big_exceptions<22> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 23: big_exceptions<23> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 24: big_exceptions<24> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 25: big_exceptions<25> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 26: big_exceptions<26> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 27: big_exceptions<27> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 28: big_exceptions<28> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 29: big_exceptions<29> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 30: big_exceptions<30> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 31: big_exceptions<31> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 1: big_exceptions<1> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 2: big_exceptions<2> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 3: big_exceptions<3> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 4: big_exceptions<4> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 5: big_exceptions<5> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 6: big_exceptions<6> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 7: big_exceptions<7> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 8: big_exceptions<8> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 9: big_exceptions<9> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 10: big_exceptions<10> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 11: big_exceptions<11> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 12: big_exceptions<12> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 13: big_exceptions<13> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 14: big_exceptions<14> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 15: big_exceptions<15> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 16: big_exceptions<16> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 17: big_exceptions<17> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 18: big_exceptions<18> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 19: big_exceptions<19> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 20: big_exceptions<20> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 21: big_exceptions<21> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 22: big_exceptions<22> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 23: big_exceptions<23> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 24: big_exceptions<24> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 25: big_exceptions<25> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 26: big_exceptions<26> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 27: big_exceptions<27> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 28: big_exceptions<28> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 29: big_exceptions<29> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 30: big_exceptions<30> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 31: big_exceptions<31> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
 			default: break;
 		}
-		if (warp_id == 0) {
+		if (thd_id == 0) {
 			for (p = 0; p < valid_idx; p++) {
 				c[idx + p] = c_idx[p];
 			}
@@ -373,40 +493,40 @@ __global__ void mm4d_gpu_mode3_c_padz_new(float* a, float* b, float* c, int* dil
 	else if (d4c_label == 1) {
 		float c_idx[part] = {0.0f};
 		switch (valid_idx) {
-			case 1: small_exceptions<1> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 2: small_exceptions<2> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 3: small_exceptions<3> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 4: small_exceptions<4> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 5: small_exceptions<5> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 6: small_exceptions<6> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 7: small_exceptions<7> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 8: small_exceptions<8> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 9: small_exceptions<9> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 10: small_exceptions<10> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 11: small_exceptions<11> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 12: small_exceptions<12> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 13: small_exceptions<13> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 14: small_exceptions<14> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 15: small_exceptions<15> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 16: small_exceptions<16> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 17: small_exceptions<17> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 18: small_exceptions<18> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 19: small_exceptions<19> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 20: small_exceptions<20> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 21: small_exceptions<21> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 22: small_exceptions<22> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 23: small_exceptions<23> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 24: small_exceptions<24> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 25: small_exceptions<25> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 26: small_exceptions<26> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 27: small_exceptions<27> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 28: small_exceptions<28> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 29: small_exceptions<29> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 30: small_exceptions<30> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
-			case 31: small_exceptions<31> (idx_a_base, idx, warp_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 1: small_exceptions<1> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 2: small_exceptions<2> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 3: small_exceptions<3> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 4: small_exceptions<4> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 5: small_exceptions<5> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 6: small_exceptions<6> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 7: small_exceptions<7> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 8: small_exceptions<8> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 9: small_exceptions<9> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 10: small_exceptions<10> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 11: small_exceptions<11> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 12: small_exceptions<12> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 13: small_exceptions<13> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 14: small_exceptions<14> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 15: small_exceptions<15> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 16: small_exceptions<16> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 17: small_exceptions<17> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 18: small_exceptions<18> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 19: small_exceptions<19> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 20: small_exceptions<20> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 21: small_exceptions<21> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 22: small_exceptions<22> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 23: small_exceptions<23> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 24: small_exceptions<24> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 25: small_exceptions<25> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 26: small_exceptions<26> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 27: small_exceptions<27> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 28: small_exceptions<28> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 29: small_exceptions<29> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 30: small_exceptions<30> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 31: small_exceptions<31> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
 			default: break;
 		}
-		if (warp_id == 0) {
+		if (thd_id == 0) {
 			for (p = valid_idx; p < part; p++) {
 				c[idx + p] = c_idx[p];
 			}
@@ -816,14 +936,18 @@ void lformerMM_original(array4d_t<float>& input1, array4d_t<float>& input2, arra
 
 void lformerMM(array4d_t<float>& input1, array4d_t<float>& input2, array4d_t<float>& output1, array1d_t<int>& dilation, array1d_t<int>& params, bool GPU){
 	int* d = dilation.data_ptr;
-	float* a = input1.data_ptr, *b = input2.data_ptr, *c = output1.data_ptr;
+	float* a = input1.data_ptr; 
+    float* b = input2.data_ptr;
+    float* c = output1.data_ptr;
 	int Window = params.data_ptr[0], WindowUpper = params.data_ptr[1], Padding = params.data_ptr[2], transposeT1 = params.data_ptr[3], coalesced = params.data_ptr[4];
-	//printf("params: %d %d %d %d %d\n", Window, WindowUpper, Padding, transposeT1, coalesced);
+	printf("params: %d %d %d %d %d\n", Window, WindowUpper, Padding, transposeT1, coalesced);
 
 	int *valid_j = (int *)malloc((invalid_idx +1) * sizeof(int));  // valid_j : valid numbers of j
 	int *start_i = (int *)malloc((invalid_idx +1) * sizeof(int));  // start_i : index of first element
 	int *start_i_last = (int *)malloc(i_last_part * sizeof(int));
-	int *v_j, *s_i, *s_i_l, l_size, i_last; // l_size: valid elements in i, q, j
+
+	int *v_j, *s_i, *s_i_l;
+    int l_size, i_last; // l_size: valid elements in i, q, j
 	cudaMalloc(&v_j, (invalid_idx +1) * sizeof(int));
 	cudaMalloc(&s_i, (invalid_idx +1) * sizeof(int));
 	cudaMalloc(&s_i_l, i_last_part * sizeof(int));
@@ -833,17 +957,20 @@ void lformerMM(array4d_t<float>& input1, array4d_t<float>& input2, array4d_t<flo
 	cudaMemcpy(s_i_l, start_i_last, i_last_part * sizeof(int), cudaMemcpyHostToDevice);
 
 	dim3 blockSize(8, 8);
-	dim3 gridSize_c((((32 + part_1)/part)*(d1 * d2 + blockSize.x - 1) / blockSize.x), (d3 * d4c + blockSize.y - 1) / blockSize.y);
 	dim3 gridSize((d1 * d2 + blockSize.x - 1) / blockSize.x, (d3 * d4c + blockSize.y - 1) / blockSize.y);
-	dim3 blocks(32, 4);
-	dim3 grids ((d1*d2*d3*d4c + 3) /4, 1);
+	
+    dim3 blocks(32, 4);
+	dim3 gridSize_c(((32/part)*(d1 * d2 + blocks.x - 1) / blocks.x), (d3 * d4c + blocks.y - 1) / blocks.y);
+	//dim3 grids ((d1*d2*d4c + 3) /4, d3);
+	//dim3 grids (d4c, d1*((d2 + 3)/4), d3);
+	dim3 grids ((d4c + part_1)/part, d1*((d2 + 3)/4), d3);
 	//printf("%d, %d %d, %d, %d %d %d %d %d\n", d1, d2, d3, d4a, d4b, d4c, grids.x, gridSize_c.x, gridSize_c.y);
 	//double start = mywtime();
 
 	if (d4c != d4b) { //mode3
 		if (coalesced == 1)
-            mm4d_gpu_mode3_c_padz_new<<<gridSize_c, blockSize>>>(a, b, c, d, v_j, s_i, s_i_l, l_size, i_last);
-            //mm4d_gpu_mode3_pr<<<grids, blocks>>>(a, b, c, d, Window, Padding);
+            mm4d_gpu_mode3_c_padz_new<<<gridSize_c, blocks>>>(a, b, c, d, v_j, s_i, s_i_l, l_size, i_last);
+            //mm4d_gpu_mode3_pr4<<<grids, blocks>>>(a, b, c, d, Window, Padding);
 		else
             mm4d_gpu_mode3_c_padz_old<<<gridSize, blockSize>>>(a, b, c, d);
 	}
@@ -855,7 +982,7 @@ void lformerMM(array4d_t<float>& input1, array4d_t<float>& input2, array4d_t<flo
  	cudaDeviceSynchronize();
 	double end = mywtime();
 	printf("cuda time = %f\n", end - start);
-	*/
+    */
 	cudaFree(s_i); cudaFree(s_i_l); cudaFree(v_j);
 	delete[] start_i; delete[] start_i_last, delete[] valid_j;
 }
