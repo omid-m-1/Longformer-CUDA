@@ -47,7 +47,7 @@ const int d2d3d4c = d2*d3*d4c;
 const int d3d4c = d3*d4c;
 const int d3d4b = d3*d4b;
 const int d4c_half = (d4c+1)/2;
-#define  part 16 // power of 2
+#define  part 32 // power of 2
 const int part_1 = part - 1;
 const int d4c_part = (d4c + part_1)/part;
 
@@ -87,7 +87,7 @@ __device__ inline float warp_reduce(float2 val1){
 template <int dim_wcount>
 __device__ inline float subwarp_reduce(float val){
     for(int offset = 16/dim_wcount; offset > 0; offset /= 2)
-        val+= __shfl_down_sync (FULL_WARP_MASK,val,offset, 16);
+        val+= __shfl_down_sync (FULL_WARP_MASK,val,offset, 32/dim_wcount);
     return val;
 }
 
@@ -323,7 +323,7 @@ __global__ void mm4d_gpu_mode3_pr4(float* a, float* b, float* c, int* dilation, 
 
 //data-reuse across i and j dimensions
 __global__ void mm4d_gpu_mode3_pr5(float* a, float* b, float* c, int* dilation, int Window, int Padding) {
-	__shared__ float4 s[512];//8 i = 8*64
+	__shared__ float4 s[128];//8 i = 8*64 = 512 float = 128 float4
     int l, i, q, j, D;
 	int ld2;
 
@@ -332,9 +332,9 @@ __global__ void mm4d_gpu_mode3_pr5(float* a, float* b, float* c, int* dilation, 
     blockIdx.x = [0, 513/part)    => j
     blockIdx.y = [0, 4096/8) => 8 rows (i).
     blockIdx.z = [0, 12)     => heads
+    2 ==> means 16 threads of a warp works on 64 dim, creating two dim_warp.
     */
 
-    int tid = threadIdx.x;
     int abs_i = (blockIdx.y* blockDim.y)*2;// 
 
     i = abs_i % d2; //which token sequence
@@ -347,33 +347,36 @@ __global__ void mm4d_gpu_mode3_pr5(float* a, float* b, float* c, int* dilation, 
 
     int j_upper = min(j+part, d4c);
     
-    int dim_wid = tid / 16; //
+    int tid = threadIdx.x;
     int dim_tid = tid % 16;
+    int dim_wid = tid / 16; //
     int local_wid = threadIdx.y*2 + dim_wid;
+    int dim_wcount = blockDim.y*2;
     
     int idx_a = ((ld2 + (i + local_wid)) * d3 + q) * d4a;
     float4 a_value = ((float4*)(a + idx_a))[dim_tid];
     s[(local_wid)*16 + dim_tid] = a_value;
 
     __syncthreads();
-    
-    for (int jj = j + local_wid; jj < j_upper; jj += 8) {
-	    
-        for (int ii = 0; ii < 8; ++ii) {
-            int condition = (i + ii + D * (jj - Window));
-            float4 b_value; 
+
+    float4 b_value; 
+    float dot = 0.0f;
+    int condition;
+
+    for (int jj = j + local_wid; jj < j_upper; jj += dim_wcount) {
+        for (int ii = 0; ii < dim_wcount; ++ii) {
+            condition = (i + ii + D * (jj - Window));
+            a_value     = s[ii*16 + dim_tid];
             if (condition >= 0 && condition < d2) {
                 int idx_b = ((ld2 + condition) * d3 + q) * d4b;
                 b_value = ((float4*)(b + idx_b))[dim_tid];
+                b_value = a_value * b_value;
+                dot     = b_value.x + b_value.y + b_value.z + b_value.w;
             }
-            a_value     = s[ii*16 + dim_tid];
-            float4 sum  = a_value * b_value;
-            float  dot  = sum.x + sum.y + sum.z + sum.w;
             dot         = subwarp_reduce<2>(dot);
 
             if (condition >= 0 && condition < d2) {
-                int index = ((ld2 + i + ii)*d3 + q)*d4c + jj;
-                if (dim_tid == 0) c[index] = dot;
+                if (dim_tid == 0) c[((ld2 + i + ii)*d3 + q)*d4c + jj] = dot;
             }
         }
     }
