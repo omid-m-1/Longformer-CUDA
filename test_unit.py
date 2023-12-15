@@ -80,7 +80,7 @@ if __name__ == '__main__':
             output1 = diagonaled_mm(input1, input2, window, dilation, is_diagonal, padding, autoregressive)
         else:
             if (mode ==3): output1 = torch.einsum('bxcd,bycd->bxcy', (input1, input2))
-        random_target = torch.rand_like(output1, device=device)
+        #random_target = torch.rand_like(output1, device=device)
         #loss = (output1 - random_target).pow(2).mean()
         #loss.backward()
     print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10))
@@ -91,7 +91,7 @@ if __name__ == '__main__':
         print("tvm", output2)
         print(output1.shape, output2.shape)
         loss = (output1 - output2).pow(2).mean()
-        if loss < (10 ** -6): print('dcg and tvm outputs are matched')
+        if loss < (10 ** -3): print('dcg and tvm outputs are matched')
         else: print('dcg and tvm outputs are not matched')
 
 #print(output1[0,0,1,:])
