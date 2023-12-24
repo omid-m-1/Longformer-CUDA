@@ -57,6 +57,7 @@ const int part_1 = part - 1;
 const int d4c_part = (d4c + part_1)/part;
 
 const int Window = 256;
+const int WindowUpper = 256;
 const int min_valid = d4c - Window + part_1 ;
 const int min_valid_part = min_valid/part;
 const int max_invalid = Window - part_1;
@@ -96,6 +97,178 @@ __device__ inline float subwarp_reduce(float val){
     return val;
 }
 
+__global__ void rearrange_a_mode2(float* a, float* a_new, int* dilation, int Window, int WindowUpper) {
+  int idx_a, idx_b, idx, idx_a_new;
+  int bx, by, tx, ty, B;
+
+  bx = blockIdx.x;
+  by = blockIdx.y;
+  tx = threadIdx.x;
+  ty = threadIdx.y;
+  B = blockDim.x*blockDim.y;
+  idx = by*gridDim.x*B + bx*B + ty*blockDim.x + tx;
+
+  int l = idx / (d2 * d3 * d4a);
+  int i = (idx / (d3 * d4a)) % d2;
+  int q = (idx / d4a) % d3;
+  int k = idx % d4a;
+  int D = dilation[q];
+
+  if (idx < d1*d2*d3*d4a) {
+    int condition = i + D * (k - WindowUpper);
+    if (condition >= 0 && condition < d2) {
+      idx_a = (((l * d2) + i + D * (k - WindowUpper)) * d3 + q) *  d4a + WindowUpper + Window - k;
+      a_new[idx] = a[idx_a];
+    }
+  }
+}
+
+__global__ void mm4d_gpu_mode2_pr4(float* a, float* b, float* c, int* dilation, int Window, int WindowUpper, int Padding) {
+		int l, i, q, j, D;
+		int ld2;
+
+    /*
+    threadIdx.y = [0, 4)     => 4 i
+    blockIdx.x = [0, 513)    => j
+    blockIdx.y = [0, 4096/4) => 4 rows (i).
+    blockIdx.z = [0, 12)     => heads
+    */
+
+    int tid = threadIdx.x;
+    int abs_i = blockIdx.y* blockDim.y + threadIdx.y;
+
+    i = abs_i % d2; //which token sequence
+		l = abs_i/d2; //which mini-batch
+		ld2 = l * d2;
+    j = blockIdx.x*part; //which attention result
+    q = blockIdx.z; //which head
+
+		D = dilation[q];
+
+    int idx_a = ((ld2 + i) * d3 + q) * d4a;
+    int idx_a_align = idx_a % 4;
+    idx_a -= idx_a_align;
+
+    int k_lower = max(WindowUpper - i / D, 0);
+    int k_upper = min(WindowUpper + (d2 - i) / D, d2);
+    k_upper = min(k_upper, d4a);
+
+    int k_align = k_lower % 4;
+    k_lower -= k_align;
+
+    float4 sum[part] = {0.0, 0.0, 0.0, 0.0};
+    for (int kk = k_lower; kk < k_upper - tid * 4 + idx_a_align; kk += 4 * 32) {
+      int k = kk / 4 + tid;
+      int idx_b;
+      float4 a_value = {0.0f, 0.0f, 0.0f, 0.0f};
+      int rem = k_upper + idx_a_align - k * 4;
+      if ((rem >= 4 || rem == 0)) a_value = ((float4*)(a + idx_a))[k];
+      else if (kk == k_lower) {
+        if (k_align == 1) a_value = make_float4(0.0f, a[idx_a + idx_a_align + k*4 + 1], a[idx_a + idx_a_align + k*4 + 2], a[idx_a + idx_a_align + k*4 + 3]);
+        else if (k_align == 2) a_value = make_float4(0.0f, 0.0f, a[idx_a + idx_a_align + k*4 + k_align + 2], a[idx_a + idx_a_align + k_align + k*4 + 3]);
+        else a_value = make_float4(0.0f, 0.0f, 0.0f, a[idx_a + idx_a_align + k*4 + 3]);
+      }
+      else {
+        if (rem == 1) a_value = make_float4(a[idx_a + k*4], 0.0f, 0.0f, 0.0f);
+        else if (rem == 2) a_value = make_float4(a[idx_a + k*4], a[idx_a + k*4 + 1], 0.0f, 0.0f);
+        else a_value = make_float4(a[idx_a + k*4], a[idx_a + k*4 + 1], a[idx_a + k*4 + 2], 0.0f);
+      }
+
+      if (kk == k_lower && tid == 0) {
+        if (k_align + idx_a_align == 4) continue;
+        else if (k_align + idx_a_align == 1) {a_value.x = 0.0f;}
+        else if (k_align + idx_a_align == 2) {a_value.x = 0.0f; a_value.y = 0.0f;}
+        else if (k_align + idx_a_align == 3) {a_value.x = 0.0f; a_value.y = 0.0f; a_value.z = 0.0f;}
+      }
+      else if (kk == k_lower && tid == 1) {
+        if (k_align + idx_a_align == 5) {a_value.x = 0.0f;}
+        else if (k_align + idx_a_align == 6) {a_value.x = 0.0f; a_value.y = 0.0f;}
+      }
+
+      int idx_b_d2 = i + D * (k * 4 - idx_a_align - WindowUpper);
+      idx_b = ((ld2 + idx_b_d2) * d3 + q) * d4b;
+      int shift_b_d2 = D * d3 * d4b;
+      float4 b_value[part] = {0.0f, 0.0f, 0.0f, 0.0f};
+      float4 b_value_j[part/4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      if (kk == k_lower && tid == 0 && (idx_a_align != 0|| k_align !=0)) {
+        if (idx_a_align + k_align >= 4) continue;
+        for (int k_b = 0; k_b < 4; k_b++) {
+          if (k_b < idx_a_align) {
+            for (int jj = 0; jj < part/4; jj++) {
+              b_value_j[jj] =  {0.0f, 0.0f, 0.0f, 0.0f};
+            }
+          }
+          else {
+            for (int jj = 0; jj < part/4; jj++) {
+              b_value_j[jj] = ((float4*)(b + idx_b + k_b * shift_b_d2))[j/4 + jj];
+            }
+          }
+
+          if (k_b == 0) {
+            for (int jj = 0 ; jj < part/4; jj++) {b_value[jj * 4].x = b_value_j[jj].x; b_value[jj * 4 + 1].x = b_value_j[jj].y; b_value[jj * 4 + 2].x = b_value_j[jj].z; b_value[jj * 4 + 3].x = b_value_j[jj].w;}}
+          else if (k_b == 1) {
+            for (int jj = 0; jj < part/4; jj++) {b_value[jj * 4].y = b_value_j[jj].x; b_value[jj * 4 + 1].y = b_value_j[jj].y; b_value[jj * 4 + 2].y = b_value_j[jj].z; b_value[jj * 4 + 3].y = b_value_j[jj].w;}}
+          else if (k_b == 2) {
+            for (int jj = 0; jj < part/4; jj++) {b_value[jj * 4].z = b_value_j[jj].x; b_value[jj * 4 + 1].z = b_value_j[jj].y; b_value[jj * 4 + 2].z = b_value_j[jj].z; b_value[jj * 4 + 3].z = b_value_j[jj].w;}}
+          else {
+            for (int jj = 0; jj < part/4; jj++) {b_value[jj * 4].w = b_value_j[jj].x; b_value[jj * 4 + 1].w = b_value_j[jj].y; b_value[jj * 4 + 2].w = b_value_j[jj].z; b_value[jj * 4 + 3].w = b_value_j[jj].w;}}
+        }
+      }
+      else {
+        for (int k_b = 0; k_b < 4; k_b++) {
+          for (int jj = 0; jj < part/4; jj++) {
+            b_value_j[jj] = ((float4*)(b + idx_b + k_b * shift_b_d2))[j/4 + jj];
+          }
+          if (k_b == 0) {
+            for (int jj = 0 ; jj < part/4; jj++) {b_value[jj * 4].x = b_value_j[jj].x; b_value[jj * 4 + 1].x = b_value_j[jj].y; b_value[jj * 4 + 2].x = b_value_j[jj].z; b_value[jj * 4 + 3].x = b_value_j[jj].w;}}
+          else if (k_b == 1) {
+            for (int jj = 0; jj < part/4; jj++) {b_value[jj * 4].y = b_value_j[jj].x; b_value[jj * 4 + 1].y = b_value_j[jj].y; b_value[jj * 4 + 2].y = b_value_j[jj].z; b_value[jj * 4 + 3].y = b_value_j[jj].w;}}
+          else if (k_b == 2) {
+            for (int jj = 0; jj < part/4; jj++) {b_value[jj * 4].z = b_value_j[jj].x; b_value[jj * 4 + 1].z = b_value_j[jj].y; b_value[jj * 4 + 2].z = b_value_j[jj].z; b_value[jj * 4 + 3].z = b_value_j[jj].w;}}
+          else {
+            for (int jj = 0; jj < part/4; jj++) {b_value[jj * 4].w = b_value_j[jj].x; b_value[jj * 4 + 1].w = b_value_j[jj].y; b_value[jj * 4 + 2].w = b_value_j[jj].z; b_value[jj * 4 + 3].w = b_value_j[jj].w;}}
+        }
+      }
+      for (int jj = 0; jj < part; jj++) {sum[jj] += a_value * b_value[jj];}
+    }
+    for (int jj = 0; jj < part; jj++) {
+      float  dot = sum[jj].x + sum[jj].y + sum[jj].z + sum[jj].w;
+      dot         = subwarp_reduce<1>(dot);
+      int index = ((ld2 + i)*d3 + q)*d4c + j + jj;
+      if(tid == 0) c[index] = dot;
+    }
+}
+
+__global__ void mm4d_gpu_mode2_c_old(float* a, float* b, float* c, int* dilation) {
+	int idx_a, idx_b, idx;
+	int bx, by, tx, ty, B;
+        float sum = 0.0f;
+
+	bx = blockIdx.x;
+	by = blockIdx.y;
+	tx = threadIdx.x;
+	ty = threadIdx.y;
+	B = blockDim.x*blockDim.y;
+	idx = by*gridDim.x*B + bx*B + ty*blockDim.x + tx;
+
+	int l = idx / (d2 * d3 * d4c);
+	int i = (idx / (d3 * d4c)) % d2;
+	int q = (idx / d4c) % d3;
+	int j = idx % d4c;
+	int D = dilation[q];
+	if (idx < cSize) {
+		for (int k = 0; k < d4a; k++) {
+			int condition = i + D * (k - WindowUpper);
+			if (condition >= 0 && condition < d2) {
+				idx_a = (((l * d2) + i + D * (k - WindowUpper)) * d3 + q) *  d4a + WindowUpper + Window - k;
+				idx_b = (((l * d2) + i + D * (k - WindowUpper)) * d3 + q) *  d4b + j;
+				sum += a[idx_a] * b[idx_b];
+			}
+		}
+                c[idx] = sum;
+	}
+}
+
 void compute_half1_invalid_idx(int* valid_j, int* start_i, int* start_i_last, int* l_size, int* i_last) {
 	int i_minusD, i_part, idx_part;
 	for (int i = 0; i < invalid_idx + 1; i++) {
@@ -118,13 +291,12 @@ void compute_half1_invalid_idx(int* valid_j, int* start_i, int* start_i_last, in
 		start_i_last[i] = Dmin_part * d3 * ((d4c_part - 1) * i - (i * (i - 1))/2);
         //printf("%d: %d\n", i, start_i_last[i]);
 	}
-
-    //printf("%d %d\n", *i_last, *l_size);
 }
 
 __global__ void mm4d_gpu_mode1_c_padz_old(float* a, float* b, float* c, int* dilation) {
 	int idx_a, idx_b, idx;
 	int bx, by, tx, ty, B;
+	float sum = 0.0f;
 
 	bx = blockIdx.x;
 	by = blockIdx.y;
@@ -146,9 +318,10 @@ __global__ void mm4d_gpu_mode1_c_padz_old(float* a, float* b, float* c, int* dil
 			if (condition >= 0 && condition < d2) {
 				idx_a = (((l * d2) + i) * d3 + q) *  d4a_m1 + k;
 				idx_b = (((l * d2) + i + D * (k - Window)) * d3 + q) *  d4b + j;
-				if (idx_a < aSize_m1 && idx_b < bSize)	c[idx] += a[idx_a] * b[idx_b];
+				sum += a[idx_a] * b[idx_b];
 			}
 		}
+		c[idx] = sum;
 	}
 }
 
@@ -200,9 +373,9 @@ __global__ void mm4d_gpu_mode1_pr4(float* a, float* b, float* c, int* dilation, 
         else a_value = make_float4(0.0f, 0.0f, 0.0f, a[idx_a + idx_a_align + k*4 + 3]);
       }
       else {
-        if (rem == 1) a_value = make_float4(a[idx_a + 0*idx_a_align + k*4], 0.0f, 0.0f, 0.0f);
-        else if (rem == 2) a_value = make_float4(a[idx_a + 0*idx_a_align + k*4], a[idx_a + 0*idx_a_align + k*4 + 1], 0.0f, 0.0f);
-        else a_value = make_float4(a[idx_a + 0*idx_a_align + k*4], a[idx_a + 0*idx_a_align + k*4 + 1], a[idx_a + 0*idx_a_align + k*4 + 2], 0.0f);
+        if (rem == 1) a_value = make_float4(a[idx_a + k*4], 0.0f, 0.0f, 0.0f);
+        else if (rem == 2) a_value = make_float4(a[idx_a + k*4], a[idx_a + k*4 + 1], 0.0f, 0.0f);
+        else a_value = make_float4(a[idx_a + k*4], a[idx_a + k*4 + 1], a[idx_a + k*4 + 2], 0.0f);
       }
 
       if (kk == k_lower && tid == 0) {
@@ -1141,7 +1314,7 @@ void lformerMM(array4d_t<float>& input1, array4d_t<float>& input2, array4d_t<flo
     float* c = output1.data_ptr;
 	int Window = params.data_ptr[0], WindowUpper = params.data_ptr[1], Padding = params.data_ptr[2], transposeT1 = params.data_ptr[3], coalesced = params.data_ptr[4];
 
-    printf("params: %d %d %d %d %d\n", Window, WindowUpper, Padding, transposeT1, coalesced);
+    // printf("params: %d %d %d %d %d\n", Window, WindowUpper, Padding, transposeT1, coalesced);
 
     /*
 	int *valid_j = (int *)malloc((invalid_idx +1) * sizeof(int));  // valid_j : valid numbers of j
@@ -1181,12 +1354,26 @@ void lformerMM(array4d_t<float>& input1, array4d_t<float>& input2, array4d_t<flo
             mm4d_gpu_mode3_c_padz_old<<<gridSize, blockSize>>>(a, b, c, d);
 	}
 	else {
-    dim3 blocks_m1(32, 4);
-  	dim3 grids_m1 ((d4c_m1 + part_1)/part, d1*((d2 + 3)/4), d3); //
-    if (coalesced == 1) mm4d_gpu_mode1_pr4<<<grids_m1, blocks_m1>>>(a, b, c, d, Window, Padding);
-    else mm4d_gpu_mode1_c_padz_old<<<gridSize, blockSize>>>(a, b, c, d);
-
-		// throw std::invalid_argument("coalesced kernel for mode 1 and 2 is not implemented.");
+            if (transposeT1 == 0) {
+                if (coalesced == 1) {
+                    dim3 blocks_m1(32, 4);
+                    dim3 grids_m1((d4c + part_1)/part, d1*((d2 + 3)/4), d3); //
+                    mm4d_gpu_mode1_pr4<<<grids_m1, blocks_m1>>>(a, b, c, d, Window, Padding);
+                }
+                else mm4d_gpu_mode1_c_padz_old<<<gridSize, blockSize>>>(a, b, c, d);
+            }
+            else{
+                if (coalesced == 1) {
+                    float *a_re;
+                    cudaMalloc(&a_re, aSize * sizeof(float));
+                    dim3 blocks_m2(32, 4);
+                    dim3 grids_m2((d4c_m1 + part_1)/part, d1*((d2 + 3)/4), d3); //
+                    dim3 grids_re((d1 * d2 + blocks_m2.x - 1) / blocks_m2.x, (d3 * d4a + blocks_m2.y - 1) / blocks_m2.y);
+                    rearrange_a_mode2<<<grids_re, blocks_m2>>>(a, a_re, d, Window, WindowUpper);
+                    mm4d_gpu_mode2_pr4<<<grids_m2, blocks_m2>>>(a_re, b, c, d, Window, WindowUpper, Padding);
+                    cudaFree(a_re);}
+                else mm4d_gpu_mode2_c_old<<<gridSize, blockSize>>>(a, b, c, d);
+            }
 	}
 
 	/*

@@ -227,7 +227,7 @@ class DiagonaledMM(torch.autograd.Function):
     min_seq_len = 16  # unexpected output if seq_len < 16
 
     @staticmethod
-    def forward(ctx, t1: torch.Tensor, t2: torch.Tensor, w: int, d: Union[torch.Tensor,int], is_t1_diagonaled: bool = False, padding: int = 0, autoregressive: bool = False) -> torch.Tensor:
+    def forward(ctx, t1: torch.Tensor, t2: torch.Tensor, w: int, d: Union[torch.Tensor,int], is_t1_diagonaled: bool = False, padding: int = 0, autoregressive: bool = False, mode: int = 3) -> torch.Tensor:
         '''Compuates diagonal_mm of t1 and t2.
         args:
         t1: torch.Tensor = (batch_size, seq_len, num_attention_heads, hidden_size|number_of_diagonals).
@@ -255,7 +255,10 @@ class DiagonaledMM(torch.autograd.Function):
         t1 = DiagonaledMM._prepare_tensors(t1)
         t2 = DiagonaledMM._prepare_tensors(t2)
         # output = t1.mm(t2)  # what would have been called if this was a regular matmul
-        output = DiagonaledMM._diagonaled_mm(t1, t2, w, d, is_t1_diagonaled=is_t1_diagonaled, padding=padding, autoregressive=autoregressive)
+        if mode != 2:
+            output = DiagonaledMM._diagonaled_mm(t1, t2, w, d, is_t1_diagonaled=is_t1_diagonaled, padding=padding, autoregressive=autoregressive)
+        else:
+            output = DiagonaledMM._diagonaled_mm(t1, t2, w, d, is_t1_diagonaled=True, transpose_t1=True, autoregressive=autoregressive)
         return output
 
     @staticmethod

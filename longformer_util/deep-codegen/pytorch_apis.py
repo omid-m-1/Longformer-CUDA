@@ -40,14 +40,14 @@ class lformerMM_impl(th.autograd.Function):
         return t
 
     @staticmethod
-    def forward(ctx, input1, input2, window, dilation, is_diagonal, padding, autoregressive, coalesced):
+    def forward(ctx, input1, input2, window, dilation, is_diagonal, padding, autoregressive, coalesced, mode):
         device0 = input1.device.type
         input1 = lformerMM_impl._prepare_tensors(input1)
         input2 = lformerMM_impl._prepare_tensors(input2)
         if isinstance(dilation, int):
             dilation = input1.new_full(size=(input1.shape[2],), fill_value=dilation, dtype=th.int, requires_grad=False, device=device0)
-        dim1_0, dim1_1, dim1_2, dim1_3 = lformerMM_impl._out_size(input1, input2, window, dilation, is_diagonal, autoregressive=autoregressive)
-        params = th.tensor([window, 0 if autoregressive else window, padding, 0, coalesced], dtype=th.int)
+        dim1_0, dim1_1, dim1_2, dim1_3 = lformerMM_impl._out_size(input1, input2, window, dilation, is_diagonal if mode != 2 else True, False if mode != 2 else True, autoregressive=autoregressive)
+        params = th.tensor([window, 0 if autoregressive else window, padding, 0 if mode != 2 else 1, coalesced], dtype=th.int)
         res = gp_apis.gp_lformerMM(input1, input2, dim1_0, dim1_1, dim1_2, dim1_3, dilation, params, device0)
         ctx.backward_cache = (input1, input2, dilation) #must be implemented
         ctx.window = window
@@ -81,5 +81,5 @@ class lformerMM_impl(th.autograd.Function):
             grd2 = gp_apis.gp_lformerMM(input1, dZ, dim1_0, dim1_1, dim1_2, dim1_3, dilation, params, device0)
         return grd1, grd2, None, None, None, None, None, None, None
 
-def lformerMM(input1, input2, window, dilation, is_diagonal = False, padding = 0, autoregressive = False, coalesced = 0):
-    return lformerMM_impl.apply(input1, input2, window, dilation, is_diagonal, padding, autoregressive, coalesced)
+def lformerMM(input1, input2, window, dilation, is_diagonal = False, padding = 0, autoregressive = False, coalesced = 0, mode = 3):
+    return lformerMM_impl.apply(input1, input2, window, dilation, is_diagonal, padding, autoregressive, coalesced, mode)
