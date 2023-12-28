@@ -52,7 +52,7 @@ const int d2d3d4c = d2*d3*d4c;
 const int d3d4c = d3*d4c;
 const int d3d4b = d3*d4b;
 const int d4c_half = (d4c+1)/2;
-#define  part 32
+#define  part 64
 const int part_1 = part - 1;
 const int d4c_part = (d4c + part_1)/part;
 
@@ -210,7 +210,8 @@ __global__ void mm4d_gpu_mode2_new(float* a, float* b, float* c, int* dilation) 
   int k_upper = min(WindowUpper + (d2 - i) / D, d2);
   k_upper = min(k_upper, d4a);
 
-  int idx_a_base = ((ld2 + i) * d3 + q) * d4a + k_lower;
+  //int idx_a_base = ((ld2 + i) * d3 + q) * d4a + k_lower; // a_rearanged
+  int idx_a_base = ((ld2 + i + D * (k_lower - WindowUpper)) * d3 + q) * d4a + WindowUpper + Window - k_lower; //main a
   int idx_b_base = ((((l*d4b) + j)*d3) + q) * d2 + i + D * (k_lower - WindowUpper);
   int index = ((ld2 + i)*d3 + q)*d4c + j;
 
@@ -219,13 +220,14 @@ __global__ void mm4d_gpu_mode2_new(float* a, float* b, float* c, int* dilation) 
   float sum[part] = {0.0f};
 
 	if (index < cSize) {
-    for (int kk = 0; kk < k_upper - k_lower - tid; kk += 32) a_value[kk/32] = a[idx_a_base + kk + tid];
+    for (int kk = 0; kk < k_upper - k_lower - tid; kk += 32) a_value[kk/32] = a[idx_a_base + (kk + tid)*(D*d3*d4a - 1)]; // a_rearranged[idx_a_base + kk + tid]
     for (int kk = 0; kk < k_upper - k_lower - tid; kk += 32) {
       for (int jj = 0; jj < part; jj++) b_value[jj] = b[idx_b_base + jj*d3*d2 + (kk + tid)*D];
       for (int jj = 0; jj < part; jj++) sum[jj] += a_value[kk/32] * b_value[jj];
     }
-    for (int jj = 0; jj < part; jj++) sum[jj] = subwarp_reduce<1>(sum[jj]);
-    for (int jj = 0; jj < part; jj++) {if(tid == 0) c[index + jj] = sum[jj];}
+    for (int jj = 0; jj < part; jj++) {
+      sum[jj] = subwarp_reduce<1>(sum[jj]);
+      if(tid == 0) c[index + jj] = sum[jj];}
   }
 }
 
@@ -1612,14 +1614,15 @@ void lformerMM(array4d_t<float>& input1, array4d_t<float>& input2, array4d_t<flo
             }
             else{
                 if (coalesced == 1) {
-                    float *a_re;
-                    cudaMalloc(&a_re, aSize * sizeof(float));
+                    //float *a_re;
+                    //cudaMalloc(&a_re, aSize * sizeof(float));
                     dim3 grids_m2((d4c_m1 + part_1)/part, d1*((d2 + 3)/4), d3); //
-                    dim3 grids_a((d1 * d2 + blocks_m.x - 1) / blocks_m.x, (d3 * d4a + blocks_m.y - 1) / blocks_m.y);
-                    rearrange_a_mode2<<<grids_a, blocks_m>>>(a, a_re, d, Window, WindowUpper);
+                    //dim3 grids_a((d1 * d2 + blocks_m.x - 1) / blocks_m.x, (d3 * d4a + blocks_m.y - 1) / blocks_m.y);
+                    //rearrange_a_mode2<<<grids_a, blocks_m>>>(a, a_re, d, Window, WindowUpper);
                     // mm4d_gpu_mode2_pr4_new<<<grids_m2, blocks_m>>>(a_re, b, c, d);
-                    mm4d_gpu_mode2_new<<<grids_m2, blocks_m>>>(a_re, b_re, c, d);
-                    cudaFree(a_re);}
+                    mm4d_gpu_mode2_new<<<grids_m2, blocks_m>>>(a, b_re, c, d);
+                    //cudaFree(a_re);}
+                    }
                 else mm4d_gpu_mode2_c_old<<<gridSize, blockSize>>>(a, b, c, d);
             }
             cudaFree(b_re);
