@@ -52,7 +52,7 @@ const int d2d3d4c = d2*d3*d4c;
 const int d3d4c = d3*d4c;
 const int d3d4b = d3*d4b;
 const int d4c_half = (d4c+1)/2;
-#define  part 8 // power of 2
+#define  part 32
 const int part_1 = part - 1;
 const int d4c_part = (d4c + part_1)/part;
 
@@ -97,6 +97,22 @@ __device__ inline float subwarp_reduce(float val){
     return val;
 }
 
+__global__ void rearrange_b(float* b, float* b_new) {
+  int bx, by, tx, ty, B;
+  bx = blockIdx.x;
+  by = blockIdx.y;
+  tx = threadIdx.x;
+  ty = threadIdx.y;
+  B = blockDim.x*blockDim.y;
+
+  int idx = by*gridDim.x*B + bx*B + ty*blockDim.x + tx;
+  int k = (idx / (d2 * d3)) % d4b;
+  int q = (idx / d2) % d3;
+  int i = idx % d2;
+  int idx_b = idx - k*d3*d2 + i*d3*d4b + q*(d4b - d2) + - i + k;
+  if (idx < d1*d2*d3*d4b) b_new[idx] = b[idx_b];
+}
+
 __global__ void rearrange_a_mode2(float* a, float* a_new, int* dilation, int Window, int WindowUpper) {
   int idx_a, idx_b, idx, idx_a_new;
   int bx, by, tx, ty, B;
@@ -119,6 +135,233 @@ __global__ void rearrange_a_mode2(float* a, float* a_new, int* dilation, int Win
     if (condition >= 0 && condition < d2) {
       idx_a = (((l * d2) + i + D * (k - WindowUpper)) * d3 + q) *  d4a + WindowUpper + Window - k;
       a_new[idx] = a[idx_a];
+    }
+  }
+}
+
+__global__ void mm4d_gpu_mode1_new(float* a, float* b, float* c, int* dilation) {
+  int l, i, q, j, D;
+  int ld2;
+
+  /*
+  threadIdx.y = [0, 4)     => 4 i
+  blockIdx.x = [0, 513)    => j
+  blockIdx.y = [0, 4096/4) => 4 rows (i).
+  blockIdx.z = [0, 12)     => heads
+  */
+
+  int tid = threadIdx.x;
+  int abs_i = blockIdx.y* blockDim.y + threadIdx.y;
+
+  i = abs_i % d2; //which token sequence
+  l = abs_i/d2; //which mini-batch
+  ld2 = l * d2;
+  j = blockIdx.x*part; //which attention result
+  q = blockIdx.z; //which head
+
+  D = dilation[q];
+
+  int k_lower = max(Window - i / D, 0);
+  int k_upper = min(Window + (d2 - i) / D, d2);
+  k_upper = min(k_upper, d4a);
+
+  int idx_a_base = ((ld2 + i) * d3 + q) * d4a + k_lower;
+  int idx_b_base = ((((l*d4b) + j)*d3) + q) * d2 + i + D * (k_lower - Window);
+  int index = ((ld2 + i)*d3 + q)*d4c + j;
+
+  float a_value[17] = {0.0f};
+  float b_value[part] = {0.0f};
+  float sum[part] = {0.0f};
+
+	if (index < cSize) {
+    for (int kk = 0; kk < k_upper - k_lower - tid; kk += 32) a_value[kk/32] = a[idx_a_base + kk + tid];
+    for (int kk = 0; kk < k_upper - k_lower - tid; kk += 32) {
+      for (int jj = 0; jj < part; jj++) b_value[jj] = b[idx_b_base + jj*d3*d2 + (kk + tid)*D];
+      for (int jj = 0; jj < part; jj++) sum[jj] += a_value[kk/32] * b_value[jj];
+    }
+    for (int jj = 0; jj < part; jj++) sum[jj] = subwarp_reduce<1>(sum[jj]);
+    for (int jj = 0; jj < part; jj++) {if(tid == 0) c[index + jj] = sum[jj];}
+  }
+}
+
+__global__ void mm4d_gpu_mode2_new(float* a, float* b, float* c, int* dilation) {
+  int l, i, q, j, D;
+  int ld2;
+
+  /*
+  threadIdx.y = [0, 4)     => 4 i
+  blockIdx.x = [0, 513)    => j
+  blockIdx.y = [0, 4096/4) => 4 rows (i).
+  blockIdx.z = [0, 12)     => heads
+  */
+
+  int tid = threadIdx.x;
+  int abs_i = blockIdx.y* blockDim.y + threadIdx.y;
+
+  i = abs_i % d2; //which token sequence
+  l = abs_i/d2; //which mini-batch
+  ld2 = l * d2;
+  j = blockIdx.x*part; //which attention result
+  q = blockIdx.z; //which head
+
+  D = dilation[q];
+
+  int k_lower = max(WindowUpper - i / D, 0);
+  int k_upper = min(WindowUpper + (d2 - i) / D, d2);
+  k_upper = min(k_upper, d4a);
+
+  int idx_a_base = ((ld2 + i) * d3 + q) * d4a + k_lower;
+  int idx_b_base = ((((l*d4b) + j)*d3) + q) * d2 + i + D * (k_lower - WindowUpper);
+  int index = ((ld2 + i)*d3 + q)*d4c + j;
+
+  float a_value[17] = {0.0f};
+  float b_value[part] = {0.0f};
+  float sum[part] = {0.0f};
+
+	if (index < cSize) {
+    for (int kk = 0; kk < k_upper - k_lower - tid; kk += 32) a_value[kk/32] = a[idx_a_base + kk + tid];
+    for (int kk = 0; kk < k_upper - k_lower - tid; kk += 32) {
+      for (int jj = 0; jj < part; jj++) b_value[jj] = b[idx_b_base + jj*d3*d2 + (kk + tid)*D];
+      for (int jj = 0; jj < part; jj++) sum[jj] += a_value[kk/32] * b_value[jj];
+    }
+    for (int jj = 0; jj < part; jj++) sum[jj] = subwarp_reduce<1>(sum[jj]);
+    for (int jj = 0; jj < part; jj++) {if(tid == 0) c[index + jj] = sum[jj];}
+  }
+}
+
+__global__ void mm4d_gpu_mode2_pr4_new(float* a, float* b, float* c, int* dilation) {
+  int l, i, q, j, D;
+  int ld2, k;
+  int idx_a, idx_b;
+
+  /*
+  threadIdx.y = [0, 4)     => 4 i
+  blockIdx.x = [0, 513)    => j
+  blockIdx.y = [0, 4096/4) => 4 rows (i).
+  blockIdx.z = [0, 12)     => heads
+  */
+
+  int tid = threadIdx.x;
+  int abs_i = blockIdx.y* blockDim.y + threadIdx.y;
+
+  i = abs_i % d2; //which token sequence
+  l = abs_i/d2; //which mini-batch
+  ld2 = l * d2;
+  j = blockIdx.x*part; //which attention result
+  q = blockIdx.z; //which head
+
+  D = dilation[q];
+
+  int k_lower = max(WindowUpper - i / D, 0); //fist k with condition >= 0
+  int k_upper = min(WindowUpper + (d2 - i) / D, d2);
+  k_upper = min(k_upper, d4a); ////last k with condition < d2
+
+  int idx_a_base = ((ld2 + i) * d3 + q) * d4a + k_lower;
+
+  int idx_b_base = ((ld2 + i + D * (k_lower - WindowUpper)) * d3 + q) * d4b;
+  int index = ((ld2 + i)*d3 + q)*d4c + j;
+
+  float a_value[20] = {0.0f};
+  float4 b_value[part] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float4 sum[part] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float4 dot[part/4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+	if (index < cSize) {
+    for (int kk = 0; kk < k_upper - k_lower - tid; kk += 128) { //kk += warpSize*4
+      k = kk / 4 + tid;
+      if (k_upper - k_lower - 4*k > 3) {a_value[4*(kk/128)] = a[idx_a_base + 4*k]; a_value[4*(kk/128) + 1] = a[idx_a_base + 4*k + 1]; a_value[4*(kk/128) + 2] = a[idx_a_base + 4*k + 2]; a_value[4*(kk/128) + 3] = a[idx_a_base + 4*k + 3];}
+      else if (k_upper - k_lower - 4*k == 3) {a_value[4*(kk/128)] = a[idx_a_base + 4*k]; a_value[4*(kk/128) + 1] = a[idx_a_base + 4*k + 1]; a_value[4*(kk/128) + 2] = a[idx_a_base + 4*k + 2]; a_value[4*(kk/128) + 3] = 0.0f;}
+      else if (k_upper - k_lower - 4*k == 2) {a_value[4*(kk/128)] = a[idx_a_base + 4*k]; a_value[4*(kk/128) + 1] = a[idx_a_base + 4*k + 1]; a_value[4*(kk/128) + 2] = 0.0f; a_value[4*(kk/128) + 3] = 0.0f;}
+      else if (k_upper - k_lower - 4*k == 1) {a_value[4*(kk/128)] = a[idx_a_base + 4*k]; a_value[4*(kk/128) + 1] = 0.0f; a_value[4*(kk/128) + 2] = 0.0f; a_value[4*(kk/128) + 3] = 0.0f;}
+    }
+    for (int kk = 0; kk < k_upper - k_lower - tid; kk += 128) {
+      k = kk / 4 + tid;
+      idx_b = idx_b_base + 4*k*D*d3*d4b;
+      //for (int jj = 0; jj < part; jj++) {b_value[jj] = ((float4*)(b + idx_b + (jj*4/part)*D*d3*d4b))[j/4 + jj%(part/4)];}
+      for (int jj = 0; jj < part; jj++) {b_value[jj] = ((float4*)(b + idx_b))[((jj*4/part)*D*d3*d4b)/4 +j/4 + jj%(part/4)];}
+      for (int jj = 0; jj < part; jj++) {sum[jj] += a_value[4*(kk/128) + (jj*4)/part] * b_value[jj];}
+    }
+    for (int jj = 0; jj < part; jj++) {dot[jj%(part/4)] += sum[jj];}
+    for (int jj = 0; jj < part/4; jj++) {
+      dot[jj].x = subwarp_reduce<1>(dot[jj].x);
+      dot[jj].y = subwarp_reduce<1>(dot[jj].y);
+      dot[jj].z = subwarp_reduce<1>(dot[jj].z);
+      dot[jj].w = subwarp_reduce<1>(dot[jj].w);
+    }
+    for (int jj = 0; jj < part; jj++) {
+      if(tid == 0 & jj%4 == 0) c[index + jj] = dot[jj/4].x;
+      else if(tid == 0 & jj%4 == 1) c[index + jj] = dot[jj/4].y;
+      else if(tid == 0 & jj%4 == 2) c[index + jj] = dot[jj/4].z;
+      else if(tid == 0 & jj%4 == 3) c[index + jj] = dot[jj/4].w;
+    }
+  }
+}
+
+
+__global__ void mm4d_gpu_mode1_pr4_new(float* a, float* b, float* c, int* dilation) {
+  int l, i, q, j, D;
+  int ld2, k;
+  int idx_a, idx_b;
+
+  /*
+  threadIdx.y = [0, 4)     => 4 i
+  blockIdx.x = [0, 513)    => j
+  blockIdx.y = [0, 4096/4) => 4 rows (i).
+  blockIdx.z = [0, 12)     => heads
+  */
+
+  int tid = threadIdx.x;
+  int abs_i = blockIdx.y* blockDim.y + threadIdx.y;
+
+  i = abs_i % d2; //which token sequence
+  l = abs_i/d2; //which mini-batch
+  ld2 = l * d2;
+  j = blockIdx.x*part; //which attention result
+  q = blockIdx.z; //which head
+
+  D = dilation[q];
+
+  int k_lower = max(Window - i / D, 0); //fist k with condition >= 0
+  int k_upper = min(Window + (d2 - i) / D, d2);
+  k_upper = min(k_upper, d4a); ////last k with condition < d2
+
+  int idx_a_base = ((ld2 + i) * d3 + q) * d4a + k_lower;
+
+  int idx_b_base = ((ld2 + i + D * (k_lower - Window)) * d3 + q) * d4b;
+  int index = ((ld2 + i)*d3 + q)*d4c + j;
+
+  float a_value[20] = {0.0f};
+  float4 b_value[part] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float4 sum[part] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float4 dot[part/4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+	if (index < cSize) {
+    for (int kk = 0; kk < k_upper - k_lower - tid; kk += 128) { //kk += warpSize*4
+      k = kk / 4 + tid;
+      if (k_upper - k_lower - 4*k > 3) {a_value[4*(kk/128)] = a[idx_a_base + 4*k]; a_value[4*(kk/128) + 1] = a[idx_a_base + 4*k + 1]; a_value[4*(kk/128) + 2] = a[idx_a_base + 4*k + 2]; a_value[4*(kk/128) + 3] = a[idx_a_base + 4*k + 3];}
+      else if (k_upper - k_lower - 4*k == 3) {a_value[4*(kk/128)] = a[idx_a_base + 4*k]; a_value[4*(kk/128) + 1] = a[idx_a_base + 4*k + 1]; a_value[4*(kk/128) + 2] = a[idx_a_base + 4*k + 2]; a_value[4*(kk/128) + 3] = 0.0f;}
+      else if (k_upper - k_lower - 4*k == 2) {a_value[4*(kk/128)] = a[idx_a_base + 4*k]; a_value[4*(kk/128) + 1] = a[idx_a_base + 4*k + 1]; a_value[4*(kk/128) + 2] = 0.0f; a_value[4*(kk/128) + 3] = 0.0f;}
+      else if (k_upper - k_lower - 4*k == 1) {a_value[4*(kk/128)] = a[idx_a_base + 4*k]; a_value[4*(kk/128) + 1] = 0.0f; a_value[4*(kk/128) + 2] = 0.0f; a_value[4*(kk/128) + 3] = 0.0f;}
+    }
+    for (int kk = 0; kk < k_upper - k_lower - tid; kk += 128) {
+      k = kk / 4 + tid;
+      idx_b = idx_b_base + 4*k*D*d3*d4b;
+      //for (int jj = 0; jj < part; jj++) {b_value[jj] = ((float4*)(b + idx_b + (jj*4/part)*D*d3*d4b))[j/4 + jj%(part/4)];}
+      for (int jj = 0; jj < part; jj++) {b_value[jj] = ((float4*)(b))[idx_b/4 + ((jj*4/part)*D*d3*d4b)/4 +j/4 + jj%(part/4)];}
+      for (int jj = 0; jj < part; jj++) {sum[jj] += a_value[4*(kk/128) + (jj*4)/part] * b_value[jj];}
+    }
+    for (int jj = 0; jj < part; jj++) {dot[jj%(part/4)] += sum[jj];}
+    for (int jj = 0; jj < part/4; jj++) {
+      dot[jj].x = subwarp_reduce<1>(dot[jj].x);
+      dot[jj].y = subwarp_reduce<1>(dot[jj].y);
+      dot[jj].z = subwarp_reduce<1>(dot[jj].z);
+      dot[jj].w = subwarp_reduce<1>(dot[jj].w);
+    }
+    for (int jj = 0; jj < part; jj++) {
+      if(tid == 0 & jj%4 == 0) c[index + jj] = dot[jj/4].x;
+      else if(tid == 0 & jj%4 == 1) c[index + jj] = dot[jj/4].y;
+      else if(tid == 0 & jj%4 == 2) c[index + jj] = dot[jj/4].z;
+      else if(tid == 0 & jj%4 == 3) c[index + jj] = dot[jj/4].w;
     }
   }
 }
@@ -1354,11 +1597,16 @@ void lformerMM(array4d_t<float>& input1, array4d_t<float>& input2, array4d_t<flo
             mm4d_gpu_mode3_c_padz_old<<<gridSize, blockSize>>>(a, b, c, d);
 	}
 	else {
+            float *b_re;
+            cudaMalloc(&b_re, bSize * sizeof(float));
+            dim3 blocks_m(32, 4);
+            dim3 grids_b((d1 * d2 + blocks_m.x - 1) / blocks_m.x, (d3 * d4b + blocks_m.y - 1) / blocks_m.y);
+            dim3 grids_m1((d4c + part_1)/part, d1*((d2 + 3)/4), d3); //
+            rearrange_b<<<grids_b, blocks_m>>>(b, b_re);
             if (transposeT1 == 0) {
                 if (coalesced == 1) {
-                    dim3 blocks_m1(32, 4);
-                    dim3 grids_m1((d4c + part_1)/part, d1*((d2 + 3)/4), d3); //
-                    mm4d_gpu_mode1_pr4<<<grids_m1, blocks_m1>>>(a, b, c, d, Window, Padding);
+                    // mm4d_gpu_mode1_pr4_new<<<grids_m1, blocks_m>>>(a, b, c, d);
+                    mm4d_gpu_mode1_new<<<grids_m1, blocks_m>>>(a, b_re, c, d);
                 }
                 else mm4d_gpu_mode1_c_padz_old<<<gridSize, blockSize>>>(a, b, c, d);
             }
@@ -1366,14 +1614,15 @@ void lformerMM(array4d_t<float>& input1, array4d_t<float>& input2, array4d_t<flo
                 if (coalesced == 1) {
                     float *a_re;
                     cudaMalloc(&a_re, aSize * sizeof(float));
-                    dim3 blocks_m2(32, 4);
                     dim3 grids_m2((d4c_m1 + part_1)/part, d1*((d2 + 3)/4), d3); //
-                    dim3 grids_re((d1 * d2 + blocks_m2.x - 1) / blocks_m2.x, (d3 * d4a + blocks_m2.y - 1) / blocks_m2.y);
-                    rearrange_a_mode2<<<grids_re, blocks_m2>>>(a, a_re, d, Window, WindowUpper);
-                    mm4d_gpu_mode2_pr4<<<grids_m2, blocks_m2>>>(a_re, b, c, d, Window, WindowUpper, Padding);
+                    dim3 grids_a((d1 * d2 + blocks_m.x - 1) / blocks_m.x, (d3 * d4a + blocks_m.y - 1) / blocks_m.y);
+                    rearrange_a_mode2<<<grids_a, blocks_m>>>(a, a_re, d, Window, WindowUpper);
+                    // mm4d_gpu_mode2_pr4_new<<<grids_m2, blocks_m>>>(a_re, b, c, d);
+                    mm4d_gpu_mode2_new<<<grids_m2, blocks_m>>>(a_re, b_re, c, d);
                     cudaFree(a_re);}
                 else mm4d_gpu_mode2_c_old<<<gridSize, blockSize>>>(a, b, c, d);
             }
+            cudaFree(b_re);
 	}
 
 	/*
