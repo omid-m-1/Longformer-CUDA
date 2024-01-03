@@ -10,6 +10,7 @@ import argparse
 
 default_input1 = [2, 4096, 12, -1]
 default_input2 = [2, 4096, 12, 64]
+padding = 0
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -21,9 +22,7 @@ if __name__ == '__main__':
     parser.add_argument('--input2_dimensions', type=int, nargs='+', default=None, help='enter four digits')
     parser.add_argument('--dilation', type=int, nargs='+', default=None, help='enter heads dimensions')
     parser.add_argument('--window', type=int, default=256)
-    parser.add_argument('--padding', type=int, default=0)
     parser.add_argument('--autoregressive', default=False, action='store_true')
-    parser.add_argument('--coalesced', default=False, action='store_true')
     parser.add_argument('--chk', default=False, action='store_true')
 
     args = parser.parse_args()
@@ -33,13 +32,11 @@ if __name__ == '__main__':
     input2_dimensions = args.input2_dimensions
     dilation = args.dilation
     window = args.window if (kernel != 'dense') else default_input1[1]
-    padding = args.padding
     autoregressive = args.autoregressive
     window_upper = 0 if autoregressive else window
-    coalesced = 1 if args.coalesced else 0
 
-    #if mode != 1 and mode != 3:
-        #raise ValueError('Forward step has mode 1 and 3')
+    if mode != 1 and mode != 3:
+        raise ValueError('Forward step has mode 1 and 3')
 
     is_diagonal = False if mode == 3 else True
 
@@ -55,7 +52,7 @@ if __name__ == '__main__':
     if input1_dimensions[:3] != input2_dimensions[:3]:
         raise ValueError('First three dimensions should be the same')
 
-    if mode == 1 or mode == 2:
+    if mode != 3:
         input1_dimensions[3] = window + window_upper + 1
     else:
         input1_dimensions[3] = input2_dimensions[3]
@@ -75,24 +72,19 @@ if __name__ == '__main__':
 
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
         if kernel == 'dcg':
-            output1 = lformerMM(input1, input2, window, dilation, is_diagonal, padding, autoregressive, coalesced, mode)
+            output1 = lformerMM(input1, input2, window, dilation, is_diagonal, autoregressive)
         elif kernel == 'tvm':
-            output1 = diagonaled_mm(input1, input2, window, dilation, is_diagonal, padding, autoregressive, mode)
+            output1 = diagonaled_mm(input1, input2, window, dilation, is_diagonal, padding, autoregressive)
         else:
             if (mode ==3): output1 = torch.einsum('bxcd,bycd->bxcy', (input1, input2))
-        #random_target = torch.rand_like(output1, device=device)
-        #loss = (output1 - random_target).pow(2).mean()
-        #loss.backward()
+        random_target = torch.rand_like(output1, device=device)
+        loss = (output1 - random_target).pow(2).mean()
+        loss.backward()
     print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10))
 
     if (args.chk == True) and (kernel == 'dcg'):
-        output2 = diagonaled_mm(input1, input2, window, dilation, is_diagonal, padding, autoregressive, mode)
-        print("dcg", output1)
-        print("tvm", output2)
+        output2 = diagonaled_mm(input1, input2, window, dilation, is_diagonal, padding, autoregressive)
         print(output1.shape, output2.shape)
         loss = (output1 - output2).pow(2).mean()
         if loss < (10 ** -3): print('dcg and tvm outputs are matched')
         else: print('dcg and tvm outputs are not matched')
-
-#print(output1[0,0,1,:])
-#print(output2[0,0,1,:])

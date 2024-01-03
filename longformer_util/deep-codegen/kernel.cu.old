@@ -1,0 +1,1640 @@
+#include "kernel.h"
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+#include <math.h>
+#include <time.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <cuda.h>
+#include <cuda_fp16.h>
+#include <mma.h>
+#include <curand.h>
+#include <curand_kernel.h>
+#include <cstdlib>
+#include <stdexcept>
+
+//Matrix A: input features/attention scores/gradients of enwik8/text8, 4 dimension: d1, d2, d3 and d4
+#include <stdio.h>
+#include "wtime.h"
+#include "helper_math.h"
+
+//Matrix B: it can be input features/values/gradients, 4 dimensions
+//Matrix C: Output result : attention scores/weighted sum/gradients
+//Matrix D: Dilation information: 1 dimension = vector of heads
+
+//https://github.com/allenai/longformer/blob/master/longformer/diagonaled_mm_tvm.py
+/* line 156 _diagonaled_mm():  t1 = A, t2 = B, d = D, and r = C
+        this should call line 16 = Omid's cuda implementation
+
+
+ */
+
+// mode 1 : d4c == d4b != d4a && d4a = (Window + WindowUpper + 1) && transposeT1 == 0
+// mode 2 : d4c == d4b != d4a && d4a = (Window + WindowUpper + 1) && transposeT1 == 1
+// mode 3 : d4c != d4b && d4a = d4b && dfc == (Window + WindowUpper + 1)
+
+const int d1 = 2; //batch size
+const int d2 = 4096; //sequence length
+const int d3 = 12; //attention head count
+const int d4a = 513; //Fourth dimension of matrix A: hidden dimension that means feature length of one token
+const int d4b = 64; //Fourth dimension of matrix B: --
+const int d4c = 64;
+const int aSize = d1*d2*d3*d4a;
+const int bSize = d1*d2*d3*d4b;
+const int cSize = d1*d2*d3*d4c;
+
+const int d4a_m1 = 513; //mode1
+const int d4c_m1 = 64; //mode1
+const int aSize_m1 = d1*d2*d3*d4a_m1; //mode1
+const int cSize_m1 = d1*d2*d3*d4c_m1; ////mode1
+
+const int d2d3d4c = d2*d3*d4c;
+const int d3d4c = d3*d4c;
+const int d3d4b = d3*d4b;
+const int d4c_half = (d4c+1)/2;
+#define  part 64
+const int part_1 = part - 1;
+const int d4c_part = (d4c + part_1)/part;
+
+const int Window = 256;
+const int WindowUpper = 256;
+const int min_valid = d4c - Window + part_1 ;
+const int min_valid_part = min_valid/part;
+const int max_invalid = Window - part_1;
+const int Dmin = 1;
+const int Dmin_minus2 = 2 - Dmin;
+const int Dmin2 = 2 * Dmin;
+const int Dmin_part = Dmin * part;
+const int Dmin_minus2_part = 2 - part * Dmin;
+const int Dmin2_part = Dmin2 * part;
+const int invalid_idx = Dmin * max_invalid;
+const int coef_b = -1 * d3 * min_valid_part * (Dmin2_part + 1); // ai^2 + bi + c = 0,
+const int coef_c1 = d3 * (Dmin * Dmin_part + 2 * Dmin -  Dmin * Dmin);
+const int d3_d4c_part = d3 * d4c_part;
+
+const int invalid_idx_last = d2 - Dmin * Window;
+const int coef_b_last = -1 * d3 * Dmin_part * (2 * d4c_part - 1);
+const int coef_a_last = -1 * d3 * Dmin_part;
+const int i_last_part = Window / part;
+
+__device__ inline float warp_reduce(float val){
+    for(int offset = 16; offset > 0; offset /= 2)
+        val+= __shfl_xor_sync (FULL_WARP_MASK,val,offset);
+    return val;
+}
+
+__device__ inline float warp_reduce(float2 val1){
+    float val = val1.x +  val1.y;
+    for(int offset = 16; offset > 0; offset /= 2)
+        val+= __shfl_xor_sync (FULL_WARP_MASK,val,offset);
+    return val;
+}
+
+template <int dim_wcount>
+__device__ inline float subwarp_reduce(float val){
+    for(int offset = 16/dim_wcount; offset > 0; offset /= 2)
+        val+= __shfl_down_sync (FULL_WARP_MASK,val,offset, 32/dim_wcount);
+    return val;
+}
+
+__global__ void rearrange_b(float* b, float* b_new) {
+  int bx, by, tx, ty, B;
+  bx = blockIdx.x;
+  by = blockIdx.y;
+  tx = threadIdx.x;
+  ty = threadIdx.y;
+  B = blockDim.x*blockDim.y;
+
+  int idx = by*gridDim.x*B + bx*B + ty*blockDim.x + tx;
+  int k = (idx / (d2 * d3)) % d4b;
+  int q = (idx / d2) % d3;
+  int i = idx % d2;
+  int idx_b = idx - k*d3*d2 + i*d3*d4b + q*(d4b - d2) + - i + k;
+  if (idx < d1*d2*d3*d4b) b_new[idx] = b[idx_b];
+}
+
+__global__ void rearrange_a_mode2(float* a, float* a_new, int* dilation, int Window, int WindowUpper) {
+  int idx_a, idx_b, idx, idx_a_new;
+  int bx, by, tx, ty, B;
+
+  bx = blockIdx.x;
+  by = blockIdx.y;
+  tx = threadIdx.x;
+  ty = threadIdx.y;
+  B = blockDim.x*blockDim.y;
+  idx = by*gridDim.x*B + bx*B + ty*blockDim.x + tx;
+
+  int l = idx / (d2 * d3 * d4a);
+  int i = (idx / (d3 * d4a)) % d2;
+  int q = (idx / d4a) % d3;
+  int k = idx % d4a;
+  int D = dilation[q];
+
+  if (idx < d1*d2*d3*d4a) {
+    int condition = i + D * (k - WindowUpper);
+    if (condition >= 0 && condition < d2) {
+      idx_a = (((l * d2) + i + D * (k - WindowUpper)) * d3 + q) *  d4a + WindowUpper + Window - k;
+      a_new[idx] = a[idx_a];
+    }
+  }
+}
+
+__global__ void mm4d_gpu_mode1_new(float* a, float* b, float* c, int* dilation) {
+  int l, i, q, j, D;
+  int ld2;
+
+  /*
+  threadIdx.y = [0, 4)     => 4 i
+  blockIdx.x = [0, 513)    => j
+  blockIdx.y = [0, 4096/4) => 4 rows (i).
+  blockIdx.z = [0, 12)     => heads
+  */
+
+  int tid = threadIdx.x;
+  int abs_i = blockIdx.y* blockDim.y + threadIdx.y;
+
+  i = abs_i % d2; //which token sequence
+  l = abs_i/d2; //which mini-batch
+  ld2 = l * d2;
+  j = blockIdx.x*part; //which attention result
+  q = blockIdx.z; //which head
+
+  D = dilation[q];
+
+  int k_lower = max(Window - i / D, 0);
+  int k_upper = min(Window + (d2 - i) / D, d2);
+  k_upper = min(k_upper, d4a);
+
+  int idx_a_base = ((ld2 + i) * d3 + q) * d4a + k_lower;
+  int idx_b_base = ((((l*d4b) + j)*d3) + q) * d2 + i + D * (k_lower - Window);
+  int index = ((ld2 + i)*d3 + q)*d4c + j;
+
+  float a_value[17] = {0.0f};
+  float b_value[part] = {0.0f};
+  float sum[part] = {0.0f};
+
+	if (index < cSize) {
+    for (int kk = 0; kk < k_upper - k_lower - tid; kk += 32) a_value[kk/32] = a[idx_a_base + kk + tid];
+    for (int kk = 0; kk < k_upper - k_lower - tid; kk += 32) {
+      for (int jj = 0; jj < part; jj++) b_value[jj] = b[idx_b_base + jj*d3*d2 + (kk + tid)*D];
+      for (int jj = 0; jj < part; jj++) sum[jj] += a_value[kk/32] * b_value[jj];
+    }
+    for (int jj = 0; jj < part; jj++) sum[jj] = subwarp_reduce<1>(sum[jj]);
+    for (int jj = 0; jj < part; jj++) {if(tid == 0) c[index + jj] = sum[jj];}
+  }
+}
+
+__global__ void mm4d_gpu_mode2_new(float* a, float* b, float* c, int* dilation) {
+  int l, i, q, j, D;
+  int ld2;
+
+  /*
+  threadIdx.y = [0, 4)     => 4 i
+  blockIdx.x = [0, 513)    => j
+  blockIdx.y = [0, 4096/4) => 4 rows (i).
+  blockIdx.z = [0, 12)     => heads
+  */
+
+  int tid = threadIdx.x;
+  int abs_i = blockIdx.y* blockDim.y + threadIdx.y;
+
+  i = abs_i % d2; //which token sequence
+  l = abs_i/d2; //which mini-batch
+  ld2 = l * d2;
+  j = blockIdx.x*part; //which attention result
+  q = blockIdx.z; //which head
+
+  D = dilation[q];
+
+  int k_lower = max(WindowUpper - i / D, 0);
+  int k_upper = min(WindowUpper + (d2 - i) / D, d2);
+  k_upper = min(k_upper, d4a);
+
+  //int idx_a_base = ((ld2 + i) * d3 + q) * d4a + k_lower; // a_rearanged
+  int idx_a_base = ((ld2 + i + D * (k_lower - WindowUpper)) * d3 + q) * d4a + WindowUpper + Window - k_lower; //main a
+  int idx_b_base = ((((l*d4b) + j)*d3) + q) * d2 + i + D * (k_lower - WindowUpper);
+  int index = ((ld2 + i)*d3 + q)*d4c + j;
+
+  float a_value[17] = {0.0f};
+  float b_value[part] = {0.0f};
+  float sum[part] = {0.0f};
+
+	if (index < cSize) {
+    for (int kk = 0; kk < k_upper - k_lower - tid; kk += 32) a_value[kk/32] = a[idx_a_base + (kk + tid)*(D*d3*d4a - 1)]; // a_rearranged[idx_a_base + kk + tid]
+    for (int kk = 0; kk < k_upper - k_lower - tid; kk += 32) {
+      for (int jj = 0; jj < part; jj++) b_value[jj] = b[idx_b_base + jj*d3*d2 + (kk + tid)*D];
+      for (int jj = 0; jj < part; jj++) sum[jj] += a_value[kk/32] * b_value[jj];
+    }
+    for (int jj = 0; jj < part; jj++) {
+      sum[jj] = subwarp_reduce<1>(sum[jj]);
+      if(tid == 0) c[index + jj] = sum[jj];}
+  }
+}
+
+__global__ void mm4d_gpu_mode2_pr4_new(float* a, float* b, float* c, int* dilation) {
+  int l, i, q, j, D;
+  int ld2, k;
+  int idx_a, idx_b;
+
+  /*
+  threadIdx.y = [0, 4)     => 4 i
+  blockIdx.x = [0, 513)    => j
+  blockIdx.y = [0, 4096/4) => 4 rows (i).
+  blockIdx.z = [0, 12)     => heads
+  */
+
+  int tid = threadIdx.x;
+  int abs_i = blockIdx.y* blockDim.y + threadIdx.y;
+
+  i = abs_i % d2; //which token sequence
+  l = abs_i/d2; //which mini-batch
+  ld2 = l * d2;
+  j = blockIdx.x*part; //which attention result
+  q = blockIdx.z; //which head
+
+  D = dilation[q];
+
+  int k_lower = max(WindowUpper - i / D, 0); //fist k with condition >= 0
+  int k_upper = min(WindowUpper + (d2 - i) / D, d2);
+  k_upper = min(k_upper, d4a); ////last k with condition < d2
+
+  int idx_a_base = ((ld2 + i) * d3 + q) * d4a + k_lower;
+
+  int idx_b_base = ((ld2 + i + D * (k_lower - WindowUpper)) * d3 + q) * d4b;
+  int index = ((ld2 + i)*d3 + q)*d4c + j;
+
+  float a_value[20] = {0.0f};
+  float4 b_value[part] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float4 sum[part] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float4 dot[part/4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+	if (index < cSize) {
+    for (int kk = 0; kk < k_upper - k_lower - tid; kk += 128) { //kk += warpSize*4
+      k = kk / 4 + tid;
+      if (k_upper - k_lower - 4*k > 3) {a_value[4*(kk/128)] = a[idx_a_base + 4*k]; a_value[4*(kk/128) + 1] = a[idx_a_base + 4*k + 1]; a_value[4*(kk/128) + 2] = a[idx_a_base + 4*k + 2]; a_value[4*(kk/128) + 3] = a[idx_a_base + 4*k + 3];}
+      else if (k_upper - k_lower - 4*k == 3) {a_value[4*(kk/128)] = a[idx_a_base + 4*k]; a_value[4*(kk/128) + 1] = a[idx_a_base + 4*k + 1]; a_value[4*(kk/128) + 2] = a[idx_a_base + 4*k + 2]; a_value[4*(kk/128) + 3] = 0.0f;}
+      else if (k_upper - k_lower - 4*k == 2) {a_value[4*(kk/128)] = a[idx_a_base + 4*k]; a_value[4*(kk/128) + 1] = a[idx_a_base + 4*k + 1]; a_value[4*(kk/128) + 2] = 0.0f; a_value[4*(kk/128) + 3] = 0.0f;}
+      else if (k_upper - k_lower - 4*k == 1) {a_value[4*(kk/128)] = a[idx_a_base + 4*k]; a_value[4*(kk/128) + 1] = 0.0f; a_value[4*(kk/128) + 2] = 0.0f; a_value[4*(kk/128) + 3] = 0.0f;}
+    }
+    for (int kk = 0; kk < k_upper - k_lower - tid; kk += 128) {
+      k = kk / 4 + tid;
+      idx_b = idx_b_base + 4*k*D*d3*d4b;
+      //for (int jj = 0; jj < part; jj++) {b_value[jj] = ((float4*)(b + idx_b + (jj*4/part)*D*d3*d4b))[j/4 + jj%(part/4)];}
+      for (int jj = 0; jj < part; jj++) {b_value[jj] = ((float4*)(b + idx_b))[((jj*4/part)*D*d3*d4b)/4 +j/4 + jj%(part/4)];}
+      for (int jj = 0; jj < part; jj++) {sum[jj] += a_value[4*(kk/128) + (jj*4)/part] * b_value[jj];}
+    }
+    for (int jj = 0; jj < part; jj++) {dot[jj%(part/4)] += sum[jj];}
+    for (int jj = 0; jj < part/4; jj++) {
+      dot[jj].x = subwarp_reduce<1>(dot[jj].x);
+      dot[jj].y = subwarp_reduce<1>(dot[jj].y);
+      dot[jj].z = subwarp_reduce<1>(dot[jj].z);
+      dot[jj].w = subwarp_reduce<1>(dot[jj].w);
+    }
+    for (int jj = 0; jj < part; jj++) {
+      if(tid == 0 & jj%4 == 0) c[index + jj] = dot[jj/4].x;
+      else if(tid == 0 & jj%4 == 1) c[index + jj] = dot[jj/4].y;
+      else if(tid == 0 & jj%4 == 2) c[index + jj] = dot[jj/4].z;
+      else if(tid == 0 & jj%4 == 3) c[index + jj] = dot[jj/4].w;
+    }
+  }
+}
+
+
+__global__ void mm4d_gpu_mode1_pr4_new(float* a, float* b, float* c, int* dilation) {
+  int l, i, q, j, D;
+  int ld2, k;
+  int idx_a, idx_b;
+
+  /*
+  threadIdx.y = [0, 4)     => 4 i
+  blockIdx.x = [0, 513)    => j
+  blockIdx.y = [0, 4096/4) => 4 rows (i).
+  blockIdx.z = [0, 12)     => heads
+  */
+
+  int tid = threadIdx.x;
+  int abs_i = blockIdx.y* blockDim.y + threadIdx.y;
+
+  i = abs_i % d2; //which token sequence
+  l = abs_i/d2; //which mini-batch
+  ld2 = l * d2;
+  j = blockIdx.x*part; //which attention result
+  q = blockIdx.z; //which head
+
+  D = dilation[q];
+
+  int k_lower = max(Window - i / D, 0); //fist k with condition >= 0
+  int k_upper = min(Window + (d2 - i) / D, d2);
+  k_upper = min(k_upper, d4a); ////last k with condition < d2
+
+  int idx_a_base = ((ld2 + i) * d3 + q) * d4a + k_lower;
+
+  int idx_b_base = ((ld2 + i + D * (k_lower - Window)) * d3 + q) * d4b;
+  int index = ((ld2 + i)*d3 + q)*d4c + j;
+
+  float a_value[20] = {0.0f};
+  float4 b_value[part] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float4 sum[part] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float4 dot[part/4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+	if (index < cSize) {
+    for (int kk = 0; kk < k_upper - k_lower - tid; kk += 128) { //kk += warpSize*4
+      k = kk / 4 + tid;
+      if (k_upper - k_lower - 4*k > 3) {a_value[4*(kk/128)] = a[idx_a_base + 4*k]; a_value[4*(kk/128) + 1] = a[idx_a_base + 4*k + 1]; a_value[4*(kk/128) + 2] = a[idx_a_base + 4*k + 2]; a_value[4*(kk/128) + 3] = a[idx_a_base + 4*k + 3];}
+      else if (k_upper - k_lower - 4*k == 3) {a_value[4*(kk/128)] = a[idx_a_base + 4*k]; a_value[4*(kk/128) + 1] = a[idx_a_base + 4*k + 1]; a_value[4*(kk/128) + 2] = a[idx_a_base + 4*k + 2]; a_value[4*(kk/128) + 3] = 0.0f;}
+      else if (k_upper - k_lower - 4*k == 2) {a_value[4*(kk/128)] = a[idx_a_base + 4*k]; a_value[4*(kk/128) + 1] = a[idx_a_base + 4*k + 1]; a_value[4*(kk/128) + 2] = 0.0f; a_value[4*(kk/128) + 3] = 0.0f;}
+      else if (k_upper - k_lower - 4*k == 1) {a_value[4*(kk/128)] = a[idx_a_base + 4*k]; a_value[4*(kk/128) + 1] = 0.0f; a_value[4*(kk/128) + 2] = 0.0f; a_value[4*(kk/128) + 3] = 0.0f;}
+    }
+    for (int kk = 0; kk < k_upper - k_lower - tid; kk += 128) {
+      k = kk / 4 + tid;
+      idx_b = idx_b_base + 4*k*D*d3*d4b;
+      //for (int jj = 0; jj < part; jj++) {b_value[jj] = ((float4*)(b + idx_b + (jj*4/part)*D*d3*d4b))[j/4 + jj%(part/4)];}
+      for (int jj = 0; jj < part; jj++) {b_value[jj] = ((float4*)(b))[idx_b/4 + ((jj*4/part)*D*d3*d4b)/4 +j/4 + jj%(part/4)];}
+      for (int jj = 0; jj < part; jj++) {sum[jj] += a_value[4*(kk/128) + (jj*4)/part] * b_value[jj];}
+    }
+    for (int jj = 0; jj < part; jj++) {dot[jj%(part/4)] += sum[jj];}
+    for (int jj = 0; jj < part/4; jj++) {
+      dot[jj].x = subwarp_reduce<1>(dot[jj].x);
+      dot[jj].y = subwarp_reduce<1>(dot[jj].y);
+      dot[jj].z = subwarp_reduce<1>(dot[jj].z);
+      dot[jj].w = subwarp_reduce<1>(dot[jj].w);
+    }
+    for (int jj = 0; jj < part; jj++) {
+      if(tid == 0 & jj%4 == 0) c[index + jj] = dot[jj/4].x;
+      else if(tid == 0 & jj%4 == 1) c[index + jj] = dot[jj/4].y;
+      else if(tid == 0 & jj%4 == 2) c[index + jj] = dot[jj/4].z;
+      else if(tid == 0 & jj%4 == 3) c[index + jj] = dot[jj/4].w;
+    }
+  }
+}
+
+__global__ void mm4d_gpu_mode2_pr4(float* a, float* b, float* c, int* dilation, int Window, int WindowUpper, int Padding) {
+		int l, i, q, j, D;
+		int ld2;
+
+    /*
+    threadIdx.y = [0, 4)     => 4 i
+    blockIdx.x = [0, 513)    => j
+    blockIdx.y = [0, 4096/4) => 4 rows (i).
+    blockIdx.z = [0, 12)     => heads
+    */
+
+    int tid = threadIdx.x;
+    int abs_i = blockIdx.y* blockDim.y + threadIdx.y;
+
+    i = abs_i % d2; //which token sequence
+		l = abs_i/d2; //which mini-batch
+		ld2 = l * d2;
+    j = blockIdx.x*part; //which attention result
+    q = blockIdx.z; //which head
+
+		D = dilation[q];
+
+    int idx_a = ((ld2 + i) * d3 + q) * d4a;
+    int idx_a_align = idx_a % 4;
+    idx_a -= idx_a_align;
+
+    int k_lower = max(WindowUpper - i / D, 0);
+    int k_upper = min(WindowUpper + (d2 - i) / D, d2);
+    k_upper = min(k_upper, d4a);
+
+    int k_align = k_lower % 4;
+    k_lower -= k_align;
+
+    float4 sum[part] = {0.0, 0.0, 0.0, 0.0};
+    for (int kk = k_lower; kk < k_upper - tid * 4 + idx_a_align; kk += 4 * 32) {
+      int k = kk / 4 + tid;
+      int idx_b;
+      float4 a_value = {0.0f, 0.0f, 0.0f, 0.0f};
+      int rem = k_upper + idx_a_align - k * 4;
+      if ((rem >= 4 || rem == 0)) a_value = ((float4*)(a + idx_a))[k];
+      else if (kk == k_lower) {
+        if (k_align == 1) a_value = make_float4(0.0f, a[idx_a + idx_a_align + k*4 + 1], a[idx_a + idx_a_align + k*4 + 2], a[idx_a + idx_a_align + k*4 + 3]);
+        else if (k_align == 2) a_value = make_float4(0.0f, 0.0f, a[idx_a + idx_a_align + k*4 + k_align + 2], a[idx_a + idx_a_align + k_align + k*4 + 3]);
+        else a_value = make_float4(0.0f, 0.0f, 0.0f, a[idx_a + idx_a_align + k*4 + 3]);
+      }
+      else {
+        if (rem == 1) a_value = make_float4(a[idx_a + k*4], 0.0f, 0.0f, 0.0f);
+        else if (rem == 2) a_value = make_float4(a[idx_a + k*4], a[idx_a + k*4 + 1], 0.0f, 0.0f);
+        else a_value = make_float4(a[idx_a + k*4], a[idx_a + k*4 + 1], a[idx_a + k*4 + 2], 0.0f);
+      }
+
+      if (kk == k_lower && tid == 0) {
+        if (k_align + idx_a_align == 4) continue;
+        else if (k_align + idx_a_align == 1) {a_value.x = 0.0f;}
+        else if (k_align + idx_a_align == 2) {a_value.x = 0.0f; a_value.y = 0.0f;}
+        else if (k_align + idx_a_align == 3) {a_value.x = 0.0f; a_value.y = 0.0f; a_value.z = 0.0f;}
+      }
+      else if (kk == k_lower && tid == 1) {
+        if (k_align + idx_a_align == 5) {a_value.x = 0.0f;}
+        else if (k_align + idx_a_align == 6) {a_value.x = 0.0f; a_value.y = 0.0f;}
+      }
+
+      int idx_b_d2 = i + D * (k * 4 - idx_a_align - WindowUpper);
+      idx_b = ((ld2 + idx_b_d2) * d3 + q) * d4b;
+      int shift_b_d2 = D * d3 * d4b;
+      float4 b_value[part] = {0.0f, 0.0f, 0.0f, 0.0f};
+      float4 b_value_j[part/4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      if (kk == k_lower && tid == 0 && (idx_a_align != 0|| k_align !=0)) {
+        if (idx_a_align + k_align >= 4) continue;
+        for (int k_b = 0; k_b < 4; k_b++) {
+          if (k_b < idx_a_align) {
+            for (int jj = 0; jj < part/4; jj++) {
+              b_value_j[jj] =  {0.0f, 0.0f, 0.0f, 0.0f};
+            }
+          }
+          else {
+            for (int jj = 0; jj < part/4; jj++) {
+              b_value_j[jj] = ((float4*)(b + idx_b + k_b * shift_b_d2))[j/4 + jj];
+            }
+          }
+
+          if (k_b == 0) {
+            for (int jj = 0 ; jj < part/4; jj++) {b_value[jj * 4].x = b_value_j[jj].x; b_value[jj * 4 + 1].x = b_value_j[jj].y; b_value[jj * 4 + 2].x = b_value_j[jj].z; b_value[jj * 4 + 3].x = b_value_j[jj].w;}}
+          else if (k_b == 1) {
+            for (int jj = 0; jj < part/4; jj++) {b_value[jj * 4].y = b_value_j[jj].x; b_value[jj * 4 + 1].y = b_value_j[jj].y; b_value[jj * 4 + 2].y = b_value_j[jj].z; b_value[jj * 4 + 3].y = b_value_j[jj].w;}}
+          else if (k_b == 2) {
+            for (int jj = 0; jj < part/4; jj++) {b_value[jj * 4].z = b_value_j[jj].x; b_value[jj * 4 + 1].z = b_value_j[jj].y; b_value[jj * 4 + 2].z = b_value_j[jj].z; b_value[jj * 4 + 3].z = b_value_j[jj].w;}}
+          else {
+            for (int jj = 0; jj < part/4; jj++) {b_value[jj * 4].w = b_value_j[jj].x; b_value[jj * 4 + 1].w = b_value_j[jj].y; b_value[jj * 4 + 2].w = b_value_j[jj].z; b_value[jj * 4 + 3].w = b_value_j[jj].w;}}
+        }
+      }
+      else {
+        for (int k_b = 0; k_b < 4; k_b++) {
+          for (int jj = 0; jj < part/4; jj++) {
+            b_value_j[jj] = ((float4*)(b + idx_b + k_b * shift_b_d2))[j/4 + jj];
+          }
+          if (k_b == 0) {
+            for (int jj = 0 ; jj < part/4; jj++) {b_value[jj * 4].x = b_value_j[jj].x; b_value[jj * 4 + 1].x = b_value_j[jj].y; b_value[jj * 4 + 2].x = b_value_j[jj].z; b_value[jj * 4 + 3].x = b_value_j[jj].w;}}
+          else if (k_b == 1) {
+            for (int jj = 0; jj < part/4; jj++) {b_value[jj * 4].y = b_value_j[jj].x; b_value[jj * 4 + 1].y = b_value_j[jj].y; b_value[jj * 4 + 2].y = b_value_j[jj].z; b_value[jj * 4 + 3].y = b_value_j[jj].w;}}
+          else if (k_b == 2) {
+            for (int jj = 0; jj < part/4; jj++) {b_value[jj * 4].z = b_value_j[jj].x; b_value[jj * 4 + 1].z = b_value_j[jj].y; b_value[jj * 4 + 2].z = b_value_j[jj].z; b_value[jj * 4 + 3].z = b_value_j[jj].w;}}
+          else {
+            for (int jj = 0; jj < part/4; jj++) {b_value[jj * 4].w = b_value_j[jj].x; b_value[jj * 4 + 1].w = b_value_j[jj].y; b_value[jj * 4 + 2].w = b_value_j[jj].z; b_value[jj * 4 + 3].w = b_value_j[jj].w;}}
+        }
+      }
+      for (int jj = 0; jj < part; jj++) {sum[jj] += a_value * b_value[jj];}
+    }
+    for (int jj = 0; jj < part; jj++) {
+      float  dot = sum[jj].x + sum[jj].y + sum[jj].z + sum[jj].w;
+      dot         = subwarp_reduce<1>(dot);
+      int index = ((ld2 + i)*d3 + q)*d4c + j + jj;
+      if(tid == 0) c[index] = dot;
+    }
+}
+
+__global__ void mm4d_gpu_mode2_c_old(float* a, float* b, float* c, int* dilation) {
+	int idx_a, idx_b, idx;
+	int bx, by, tx, ty, B;
+        float sum = 0.0f;
+
+	bx = blockIdx.x;
+	by = blockIdx.y;
+	tx = threadIdx.x;
+	ty = threadIdx.y;
+	B = blockDim.x*blockDim.y;
+	idx = by*gridDim.x*B + bx*B + ty*blockDim.x + tx;
+
+	int l = idx / (d2 * d3 * d4c);
+	int i = (idx / (d3 * d4c)) % d2;
+	int q = (idx / d4c) % d3;
+	int j = idx % d4c;
+	int D = dilation[q];
+	if (idx < cSize) {
+		for (int k = 0; k < d4a; k++) {
+			int condition = i + D * (k - WindowUpper);
+			if (condition >= 0 && condition < d2) {
+				idx_a = (((l * d2) + i + D * (k - WindowUpper)) * d3 + q) *  d4a + WindowUpper + Window - k;
+				idx_b = (((l * d2) + i + D * (k - WindowUpper)) * d3 + q) *  d4b + j;
+				sum += a[idx_a] * b[idx_b];
+			}
+		}
+                c[idx] = sum;
+	}
+}
+
+void compute_half1_invalid_idx(int* valid_j, int* start_i, int* start_i_last, int* l_size, int* i_last) {
+	int i_minusD, i_part, idx_part;
+	for (int i = 0; i < invalid_idx + 1; i++) {
+		if (i >= Dmin) {
+			i_minusD = i - Dmin;
+			i_part = i_minusD / Dmin_part;
+			idx_part = i_part * Dmin_part;
+			valid_j[i] = min_valid_part + i_part + 1;
+			start_i[i] = d3 * (min_valid_part * i + ((idx_part * (idx_part + Dmin_minus2_part)) / Dmin2_part) + ((i_minusD % Dmin_part) * i_part) + i_minusD - i_part);
+		}
+		else {
+			valid_j[i] = min_valid_part;
+			start_i[i] = d3 * min_valid_part * i;
+		}
+        //printf("%d: %d %d\n", i, valid_j[i], start_i[i]);
+	}
+	*i_last = (invalid_idx_last - invalid_idx) * d3 * d4c_part + start_i[invalid_idx];
+	*l_size = *i_last + Dmin_part * d3 * ((d4c_part - 1) * i_last_part - (i_last_part * (i_last_part - 1))/2);
+	for (int i = 0; i < i_last_part; i++) {
+		start_i_last[i] = Dmin_part * d3 * ((d4c_part - 1) * i - (i * (i - 1))/2);
+        //printf("%d: %d\n", i, start_i_last[i]);
+	}
+}
+
+__global__ void mm4d_gpu_mode1_c_padz_old(float* a, float* b, float* c, int* dilation) {
+	int idx_a, idx_b, idx;
+	int bx, by, tx, ty, B;
+	float sum = 0.0f;
+
+	bx = blockIdx.x;
+	by = blockIdx.y;
+	tx = threadIdx.x;
+	ty = threadIdx.y;
+	B = blockDim.x*blockDim.y;
+	idx = by*gridDim.x*B + bx*B + ty*blockDim.x + tx;
+
+	int l = idx / (d2 * d3 * d4c_m1);
+	int i = (idx / (d3 * d4c_m1)) % d2;
+	int q = (idx / d4c_m1) % d3;
+	int j = idx % d4c_m1;
+	int D = dilation[q];
+
+	if (idx < cSize_m1) {
+		c[idx] = 0.0f;
+		for (int k = 0; k < d4a_m1; k++) {
+			int condition = i + D * (k - Window);
+			if (condition >= 0 && condition < d2) {
+				idx_a = (((l * d2) + i) * d3 + q) *  d4a_m1 + k;
+				idx_b = (((l * d2) + i + D * (k - Window)) * d3 + q) *  d4b + j;
+				sum += a[idx_a] * b[idx_b];
+			}
+		}
+		c[idx] = sum;
+	}
+}
+
+__global__ void mm4d_gpu_mode1_pr4(float* a, float* b, float* c, int* dilation, int Window, int Padding) {
+		int l, i, q, j, D;
+		int ld2;
+
+    /*
+    threadIdx.y = [0, 4)     => 4 i
+    blockIdx.x = [0, 513)    => j
+    blockIdx.y = [0, 4096/4) => 4 rows (i).
+    blockIdx.z = [0, 12)     => heads
+    */
+
+    int tid = threadIdx.x;
+    int abs_i = blockIdx.y* blockDim.y + threadIdx.y;
+
+    i = abs_i % d2; //which token sequence
+		l = abs_i/d2; //which mini-batch
+		ld2 = l * d2;
+    j = blockIdx.x*part; //which attention result
+    q = blockIdx.z; //which head
+
+		D = dilation[q];
+
+    int idx_a = ((ld2 + i) * d3 + q) * d4a_m1;
+    int idx_a_align = idx_a % 4;
+    idx_a -= idx_a_align;
+    int k_last = 0;
+    if (idx_a_align != 0) k_last = 4;
+
+    int k_lower = max(Window - i / D, 0);
+    int k_upper = min(Window + (d2 - i) / D, d2);
+    k_upper = min(k_upper, d4a_m1);
+
+    int k_align = k_lower % 4;
+    k_lower -= k_align;
+
+    float4 sum[part] = {0.0, 0.0, 0.0, 0.0};
+    for (int kk = k_lower; kk < k_upper - tid * 4 + idx_a_align; kk += 4 * 32) {
+      int k = kk / 4 + tid;
+      int idx_b;
+      float4 a_value = {0.0f, 0.0f, 0.0f, 0.0f};
+      int rem = k_upper + idx_a_align - k * 4;
+      if ((rem >= 4 || rem == 0)) a_value = ((float4*)(a + idx_a))[k];
+      else if (kk == k_lower) {
+        if (k_align == 1) a_value = make_float4(0.0f, a[idx_a + idx_a_align + k*4 + 1], a[idx_a + idx_a_align + k*4 + 2], a[idx_a + idx_a_align + k*4 + 3]);
+        else if (k_align == 2) a_value = make_float4(0.0f, 0.0f, a[idx_a + idx_a_align + k*4 + k_align + 2], a[idx_a + idx_a_align + k_align + k*4 + 3]);
+        else a_value = make_float4(0.0f, 0.0f, 0.0f, a[idx_a + idx_a_align + k*4 + 3]);
+      }
+      else {
+        if (rem == 1) a_value = make_float4(a[idx_a + k*4], 0.0f, 0.0f, 0.0f);
+        else if (rem == 2) a_value = make_float4(a[idx_a + k*4], a[idx_a + k*4 + 1], 0.0f, 0.0f);
+        else a_value = make_float4(a[idx_a + k*4], a[idx_a + k*4 + 1], a[idx_a + k*4 + 2], 0.0f);
+      }
+
+      if (kk == k_lower && tid == 0) {
+        if (k_align + idx_a_align == 4) continue;
+        else if (k_align + idx_a_align == 1) {a_value.x = 0.0f;}
+        else if (k_align + idx_a_align == 2) {a_value.x = 0.0f; a_value.y = 0.0f;}
+        else if (k_align + idx_a_align == 3) {a_value.x = 0.0f; a_value.y = 0.0f; a_value.z = 0.0f;}
+      }
+      else if (kk == k_lower && tid == 1) {
+        if (k_align + idx_a_align == 5) {a_value.x = 0.0f;}
+        else if (k_align + idx_a_align == 6) {a_value.x = 0.0f; a_value.y = 0.0f;}
+      }
+
+      int idx_b_d2 = i + D * (k * 4 - idx_a_align - Window);
+      idx_b = ((ld2 + idx_b_d2) * d3 + q) * d4b;
+      int shift_b_d2 = D * d3 * d4b;
+      float4 b_value[part] = {0.0f, 0.0f, 0.0f, 0.0f};
+      float4 b_value_j[part/4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      if (kk == k_lower && tid == 0 && (idx_a_align != 0|| k_align !=0)) {
+        if (idx_a_align + k_align >= 4) continue;
+        for (int k_b = 0; k_b < 4; k_b++) {
+          if (k_b < idx_a_align) {
+            for (int jj = 0; jj < part/4; jj++) {
+              b_value_j[jj] =  {0.0f, 0.0f, 0.0f, 0.0f};
+            }
+          }
+          else {
+            for (int jj = 0; jj < part/4; jj++) {
+              b_value_j[jj] = ((float4*)(b + idx_b + k_b * shift_b_d2))[j/4 + jj];
+            }
+          }
+
+          if (k_b == 0) {
+            for (int jj = 0 ; jj < part/4; jj++) {b_value[jj * 4].x = b_value_j[jj].x; b_value[jj * 4 + 1].x = b_value_j[jj].y; b_value[jj * 4 + 2].x = b_value_j[jj].z; b_value[jj * 4 + 3].x = b_value_j[jj].w;}}
+          else if (k_b == 1) {
+            for (int jj = 0; jj < part/4; jj++) {b_value[jj * 4].y = b_value_j[jj].x; b_value[jj * 4 + 1].y = b_value_j[jj].y; b_value[jj * 4 + 2].y = b_value_j[jj].z; b_value[jj * 4 + 3].y = b_value_j[jj].w;}}
+          else if (k_b == 2) {
+            for (int jj = 0; jj < part/4; jj++) {b_value[jj * 4].z = b_value_j[jj].x; b_value[jj * 4 + 1].z = b_value_j[jj].y; b_value[jj * 4 + 2].z = b_value_j[jj].z; b_value[jj * 4 + 3].z = b_value_j[jj].w;}}
+          else {
+            for (int jj = 0; jj < part/4; jj++) {b_value[jj * 4].w = b_value_j[jj].x; b_value[jj * 4 + 1].w = b_value_j[jj].y; b_value[jj * 4 + 2].w = b_value_j[jj].z; b_value[jj * 4 + 3].w = b_value_j[jj].w;}}
+        }
+      }
+      else {
+        for (int k_b = 0; k_b < 4; k_b++) {
+          for (int jj = 0; jj < part/4; jj++) {
+            b_value_j[jj] = ((float4*)(b + idx_b + k_b * shift_b_d2))[j/4 + jj];
+          }
+          if (k_b == 0) {
+            for (int jj = 0 ; jj < part/4; jj++) {b_value[jj * 4].x = b_value_j[jj].x; b_value[jj * 4 + 1].x = b_value_j[jj].y; b_value[jj * 4 + 2].x = b_value_j[jj].z; b_value[jj * 4 + 3].x = b_value_j[jj].w;}}
+          else if (k_b == 1) {
+            for (int jj = 0; jj < part/4; jj++) {b_value[jj * 4].y = b_value_j[jj].x; b_value[jj * 4 + 1].y = b_value_j[jj].y; b_value[jj * 4 + 2].y = b_value_j[jj].z; b_value[jj * 4 + 3].y = b_value_j[jj].w;}}
+          else if (k_b == 2) {
+            for (int jj = 0; jj < part/4; jj++) {b_value[jj * 4].z = b_value_j[jj].x; b_value[jj * 4 + 1].z = b_value_j[jj].y; b_value[jj * 4 + 2].z = b_value_j[jj].z; b_value[jj * 4 + 3].z = b_value_j[jj].w;}}
+          else {
+            for (int jj = 0; jj < part/4; jj++) {b_value[jj * 4].w = b_value_j[jj].x; b_value[jj * 4 + 1].w = b_value_j[jj].y; b_value[jj * 4 + 2].w = b_value_j[jj].z; b_value[jj * 4 + 3].w = b_value_j[jj].w;}}
+        }
+      }
+
+      for (int jj = 0; jj < part; jj++) {sum[jj] += a_value * b_value[jj];}
+    }
+    for (int jj = 0; jj < part; jj++) {
+      float  dot = sum[jj].x + sum[jj].y + sum[jj].z + sum[jj].w;
+      dot         = subwarp_reduce<1>(dot);
+      int index = ((ld2 + i)*d3 + q)*d4c_m1 + j + jj;
+      if(tid == 0) c[index] = dot;
+    }
+}
+
+__global__ void mm4d_gpu_mode3_c_padz_old(float* a, float* b, float* c, int* dilation) {
+	int idx_a, idx_b, idx;
+	int l, i, q, j, D;
+	int condition, k, ld2, idx_a_base;
+	float sum = 0.0f;
+
+	idx = ((blockIdx.y*gridDim.x + blockIdx.x)*blockDim.x*blockDim.y + threadIdx.y*blockDim.x + threadIdx.x);
+	if (idx >= cSize) return;
+
+	i = (idx / d3d4c) % d2;
+	q = (idx / d4c) % d3;
+	j = idx % d4c;
+	D = dilation[q];
+	condition = i + D * (j - Window);
+	if (condition < 0 || condition >= d2) return;
+	l = idx / d2d3d4c;
+	ld2 = l * d2;
+	idx_a_base = ((ld2 + i) * d3 + q) * d4a;
+
+	for (k = 0; k < d4a; k++) {
+		idx_a = idx_a_base + k;
+		idx_b = ((ld2 + condition) * d3 + q) * d4b + k;
+		sum += a[idx_a] * b[idx_b];
+	}
+	c[idx] = sum;
+}
+
+//Newly written, very slow
+__global__ void mm4d_gpu_mode3_pr(float* a, float* b, float* c, int* dilation, int Window, int Padding) {
+	int l, i, q, j, D;
+	int k, ld2;
+
+    int tid = threadIdx.x;
+	int warp_id =  blockIdx.x * 4 + threadIdx.y;
+	if (warp_id >= cSize) return;
+
+	i = (warp_id / d3d4c) % d2;//which token sequence
+	q = (warp_id / d4c) % d3; //which head
+	j = warp_id % d4c;   //which attention result
+	D = dilation[q];
+
+	int condition = i + D * (j - Window);
+	if (condition < 0 || condition >= d2) return;
+
+	l = warp_id / d2d3d4c;
+	ld2 = l * d2;
+
+    int idx_a = ((ld2 + i) * d3 + q) * d4a;
+    int idx_b = ((ld2 + condition) * d3 + q) * d4b;
+
+    float2 a_value = ((float2*)(a + idx_a))[tid];
+    float2 b_value = ((float2*)(b + idx_b))[tid];
+    float2 sum     = a_value * b_value;
+
+    sum.x = warp_reduce(sum);
+	if (tid == 0) c[warp_id] = sum.x;
+}
+
+__global__ void mm4d_gpu_mode3_pr2(float* a, float* b, float* c, int* dilation, int Window, int Padding) {
+	int l, i, q, j, D;
+	int k, ld2;
+
+    int tid = threadIdx.x;
+	int warp_id =  blockIdx.x * 4 + threadIdx.y;
+	if (warp_id >= cSize) return;
+
+	i = (warp_id / d4c) % d2;//which token sequence
+	q = blockIdx.y; //(warp_id / d4c) % d3; //which head
+	j = warp_id % d4c;   //which attention result
+	D = dilation[q];
+
+	int condition = i + D * (j - Window);
+	if (condition < 0 || condition >= d2) return;
+
+	l = warp_id / (d2*d4c);
+	ld2 = l * d2;
+
+    int idx_a = ((ld2 + i) * d3 + q) * d4a;
+    int idx_b = ((ld2 + condition) * d3 + q) * d4b;
+
+    float2 a_value = ((float2*)(a + idx_a))[tid];
+    float2 b_value = ((float2*)(b + idx_b))[tid];
+    float2 sum     = a_value * b_value;
+
+    sum.x = warp_reduce(sum);
+    if (tid == 0) c[((ld2 + i) * d3 + q) * d4c + j] = sum.x;
+}
+
+__global__ void mm4d_gpu_mode3_pr3(float* a, float* b, float* c, int* dilation, int Window, int Padding) {
+	int l, i, q, j, D;
+	int k, ld2;
+
+    /*
+    threadIdx.y = [0, 4)     => 4 i
+    blockIdx.x = [0, 513)    => j
+    blockIdx.y = [0, 4096/4) => 4 rows (i).
+    blockIdx.z = [0, 12)     => heads
+    */
+
+    int tid = threadIdx.x;
+    int abs_i = blockIdx.y* blockDim.y + threadIdx.y;
+
+    i = abs_i % d2; //which token sequence
+    j = blockIdx.x; //which attention result
+    q = blockIdx.z; //which head
+
+	D = dilation[q];
+
+	int condition = i + D * (j - Window);
+	if (condition < 0 || condition >= d2) return;
+
+	l = abs_i/d2; //which mini-batch
+	ld2 = l * d2;
+
+    int idx_a = ((ld2 + i) * d3 + q) * d4a;
+    int idx_b = ((ld2 + condition) * d3 + q) * d4b;
+
+    float2 a_value = ((float2*)(a + idx_a))[tid];
+    float2 b_value = ((float2*)(b + idx_b))[tid];
+    float2 sum     = a_value * b_value;
+
+    sum.x = warp_reduce(sum);
+    if (tid == 0) c[((ld2 + i) * d3 + q) * d4c + j] = sum.x;
+}
+
+//data-reuse across i dimension
+__global__ void mm4d_gpu_mode3_pr4(float* a, float* b, float* c, int* dilation, int Window, int Padding) {
+	int l, i, q, j, D;
+	int ld2;
+
+    /*
+    threadIdx.y = [0, 4)     => 4 i
+    blockIdx.x = [0, 513)    => j
+    blockIdx.y = [0, 4096/4) => 4 rows (i).
+    blockIdx.z = [0, 12)     => heads
+    */
+
+    int tid = threadIdx.x;
+    int abs_i = blockIdx.y* blockDim.y + threadIdx.y;
+
+    i = abs_i % d2; //which token sequence
+	l = abs_i/d2; //which mini-batch
+	ld2 = l * d2;
+    j = blockIdx.x*part; //which attention result
+    q = blockIdx.z; //which head
+
+	D = dilation[q];
+
+    int j_upper = min(j+part, d4c);
+    int idx_a = ((ld2 + i) * d3 + q) * d4a;
+
+    int dim_wid = tid / 16;
+    int dim_tid = tid % 16;
+    float4 a_value = ((float4*)(a + idx_a))[dim_tid];
+
+    for (int jj = j + dim_wid; jj < j_upper; jj += 2) {
+	    int condition = (i + D * (jj - Window));
+	    float4 b_value;
+        if (condition >= 0 && condition < d2) {
+            int idx_b = ((ld2 + condition) * d3 + q) * d4b;
+            b_value = ((float4*)(b + idx_b))[dim_tid];
+        }
+
+        float4 sum  = a_value * b_value;
+        float  dot  = sum.x + sum.y + sum.z + sum.w;
+        dot         = subwarp_reduce<2>(dot);
+
+	    if (condition >= 0 && condition < d2) {
+            int index = ((ld2 + i)*d3 + q)*d4c + jj;
+            if (dim_tid == 0) c[index] = dot;
+        }
+    }
+}
+
+//data-reuse across i and j dimensions
+__global__ void mm4d_gpu_mode3_pr5(float* a, float* b, float* c, int* dilation, int Window, int Padding) {
+	__shared__ float4 s[128];//8 i = 8*64 = 512 float = 128 float4
+    int l, i, q, j, D;
+	int ld2;
+
+    /*
+    threadIdx.y = [0, 4)     => 4 i
+    blockIdx.x = [0, 513/part)    => j
+    blockIdx.y = [0, 4096/8) => 8 rows (i).
+    blockIdx.z = [0, 12)     => heads
+    2 ==> means 16 threads of a warp works on 64 dim, creating two dim_warp.
+    */
+
+    int abs_i = (blockIdx.y* blockDim.y)*2;//
+
+    i = abs_i % d2; //which token sequence
+	l = abs_i/d2; //which mini-batch
+	ld2 = l * d2;
+    j = blockIdx.x*part; //which attention result
+    q = blockIdx.z; //which head
+
+	D = dilation[q];
+
+    int j_upper = min(j+part, d4c);
+
+    int tid = threadIdx.x;
+    int dim_tid = tid % 16;
+    int dim_wid = tid / 16; //
+    int local_wid = threadIdx.y*2 + dim_wid;
+    int dim_wcount = blockDim.y*2;
+
+    int idx_a = ((ld2 + (i + local_wid)) * d3 + q) * d4a;
+    float4 a_value = ((float4*)(a + idx_a))[dim_tid];
+    s[(local_wid)*16 + dim_tid] = a_value;
+
+    __syncthreads();
+
+    float4 b_value;
+    float dot = 0.0f;
+    int condition;
+
+    for (int jj = j + local_wid; jj < j_upper; jj += dim_wcount) {
+        for (int ii = 0; ii < dim_wcount; ++ii) {
+            condition = (i + ii + D * (jj - Window));
+            a_value     = s[ii*16 + dim_tid];
+            if (condition >= 0 && condition < d2) {
+                int idx_b = ((ld2 + condition) * d3 + q) * d4b;
+                b_value = ((float4*)(b + idx_b))[dim_tid];
+                b_value = a_value * b_value;
+                dot     = b_value.x + b_value.y + b_value.z + b_value.w;
+            }
+            dot         = subwarp_reduce<2>(dot);
+
+            if (condition >= 0 && condition < d2) {
+                if (dim_tid == 0) c[((ld2 + i + ii)*d3 + q)*d4c + jj] = dot;
+            }
+        }
+    }
+}
+
+template <int valid_idx>
+inline __device__ void small_exceptions(int idx_a_base, int idx, int thd_id, int d4a, float *a, float *b, float *sum, int idx_b_base) {
+	float aa, bb;
+	int idx_b;
+	unsigned mask;
+	for (int k = thd_id; k < d4a ; k += 32) {
+		aa = __ldg(&a[idx_a_base + k]);
+		for (int p = valid_idx; p < part; p++) {
+			idx_b = idx_b_base + p*768 + k;
+			bb = __ldg(&b[idx_b]);
+			sum[p] += aa * bb;
+		}
+	}
+
+	for (int offset = 16; offset > 0; offset /= 2) {
+		mask = (1 << 2*offset) - 1;
+		for (int p = valid_idx; p < part; p++) {
+			sum[p] += __shfl_xor_sync(mask, sum[p], offset, 2*offset);
+		}
+	}
+}
+
+template <int valid_idx>
+inline __device__ void big_exceptions(int idx_a_base, int idx, int thd_id, int d4a, float *a, float *b, float *sum, int idx_b_base) {
+	float aa, bb;
+	int idx_b;
+	unsigned mask;
+	for (int k = thd_id; k < d4a ; k += 32) {
+		aa = __ldg(&a[idx_a_base + k]);
+		for (int p = 0; p < valid_idx; p++) {
+			idx_b = idx_b_base + p*768 + k;
+			bb = __ldg(&b[idx_b]);
+			sum[p] += aa * bb;
+		}
+	}
+
+	for (int offset = 16; offset > 0; offset /= 2) {
+		mask = (1 << 2*offset) - 1;
+		for (int p = 0; p < valid_idx; p++) {
+			sum[p] += __shfl_xor_sync(mask, sum[p], offset, 2*offset);
+		}
+	}
+}
+
+__global__ void mm4d_gpu_mode3_c_padz_new(float* a, float* b, float* c, int* dilation, int* valid_j, int* start_i, int* start_i_last, int l_size, int i_last) {
+  //int idx_warp = ((blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x * blockDim.y + threadIdx.y * blockDim.x + threadIdx.x);
+  //int idx = idx_warp/32;
+
+  int thd_id = threadIdx.x;
+  int abs_warp_id = ((blockIdx.y * gridDim.x + blockIdx.x) * blockDim.y + threadIdx.y);
+
+  int l, i, q, j_first;
+  l = abs_warp_id / l_size;
+
+  int remaining_l = abs_warp_id % l_size;
+  int remaining_start = remaining_l - start_i[invalid_idx];
+  int remaining_end = remaining_l - i_last;
+
+  if (remaining_start >= 0 && remaining_end < 0) {
+    i = remaining_start / d3_d4c_part + invalid_idx;
+    q = (remaining_start / d4c_part) % d3;
+    j_first = (remaining_start % d4c_part) * part;
+
+  } else if (remaining_end >= 0) {
+    int i_part = (coef_b_last + sqrtf(coef_b_last * coef_b_last + 8 * coef_a_last * remaining_end)) / (2 * coef_a_last);
+    int valid_j_last = d4c_part - 1 - i_part;
+    // remaining_end -= d3 * Dmin_part * ((d4c_part - 1) * i_part - (i_part * (i_part - 1))/2);
+    remaining_end -= start_i_last[i_part];
+    i = invalid_idx_last + i_part * Dmin_part + remaining_end / (d3 * valid_j_last);
+    q = (remaining_end / valid_j_last) % d3;
+    j_first = (remaining_end % valid_j_last) * part;
+
+  } else if (remaining_l >= Dmin * d3 * valid_j[0]) {
+    i = (coef_b + sqrtf(coef_b * coef_b + 4 * d3 * (coef_c1 + Dmin2_part * remaining_l)))/(2 * d3);
+
+    remaining_start = remaining_l - start_i[i];
+    remaining_end = remaining_l - start_i[i+1];
+
+    if (remaining_start < 0) {i = i - 1; remaining_start = remaining_l - start_i[i];}
+    else if (remaining_end >= 0) {i = i + 1; remaining_start = remaining_l - start_i[i];}
+    remaining_end = remaining_l - start_i[i+1];
+
+    q = remaining_start / valid_j[i];
+    j_first = ((remaining_start % valid_j[i]) + d4c_part - valid_j[i]) * part;
+
+  } else {
+    i = remaining_l/(d3 * valid_j[0]);
+    remaining_start = remaining_l - start_i[i];
+
+    q = (remaining_start / valid_j[0]) % d3;
+    j_first = ((remaining_start % valid_j[0]) + d4c_part - valid_j[0]) * part;
+  }
+
+  int idx = l * d2d3d4c + i * d3d4c + q * d4c + j_first;
+  if (idx >= cSize) return;
+
+  int j_last, D, d4c_label, condition_first, condition_last;
+	D = dilation[q];
+	condition_first = i + D * (j_first - Window);
+	condition_last = condition_first + part_1 * D;
+    if (condition_last < 0 || condition_first >= d2) return;
+	j_last = j_first + part_1;
+	int valid_idx;
+
+	if (j_last < d4c) {
+		if (condition_first >= 0 && condition_last < d2) {d4c_label = 3;}
+		else if (condition_last < d2) {d4c_label = 1; valid_idx = -1*((condition_first + 1 - D)/D);}
+		else {d4c_label = 2, valid_idx = (d2 - condition_first + D - 1)/D;}
+	} else {
+        d4c_label = 2; valid_idx = d4c - j_first;
+    }
+	int ld2 = l * d2;
+	int idx_a_base = ((ld2 + i) * d3 + q) * d4a;
+	int idx_b_base = ((ld2 + condition_first) * d3 + q) * d4b;
+	int idx_diff = D * d3d4b;
+	int p;
+    //if (idx < 513 && idx > 513 + 256) printf("%d %d %d %d %d %d\n", idx_warp, j_first, condition_first, condition_last, idx_diff, Window);
+
+	if (d4c_label == 3) {
+		float sum[part] = {0.0f};
+		float aa, bb;
+		unsigned mask;
+		for (int k = thd_id; k < d4a ; k += 32) {
+			aa = __ldg(&a[idx_a_base + k]);
+			for (p = 0; p < part; p++) {
+				bb = __ldg(&b[idx_b_base + p*idx_diff + k]);
+				sum[p] += aa * bb;
+			}
+		}
+
+		for (int offset = 16; offset > 0; offset /= 2) {
+			mask = (1 << 2*offset) - 1;
+			for (int p = 0; p < part; p++) {
+				sum[p] += __shfl_xor_sync(mask, sum[p], offset, 2*offset);
+			}
+		}
+		if (thd_id == 0) {
+			for (int p = 0; p < part; p++) {
+				c[idx + p] = sum[p];
+			}
+		}
+	}
+	else if (d4c_label == 2) {
+		float c_idx[part] = {0.0f};
+		switch (valid_idx) {
+			case 1: big_exceptions<1> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 2: big_exceptions<2> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 3: big_exceptions<3> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 4: big_exceptions<4> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 5: big_exceptions<5> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 6: big_exceptions<6> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 7: big_exceptions<7> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 8: big_exceptions<8> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 9: big_exceptions<9> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 10: big_exceptions<10> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 11: big_exceptions<11> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 12: big_exceptions<12> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 13: big_exceptions<13> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 14: big_exceptions<14> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 15: big_exceptions<15> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 16: big_exceptions<16> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 17: big_exceptions<17> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 18: big_exceptions<18> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 19: big_exceptions<19> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 20: big_exceptions<20> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 21: big_exceptions<21> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 22: big_exceptions<22> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 23: big_exceptions<23> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 24: big_exceptions<24> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 25: big_exceptions<25> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 26: big_exceptions<26> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 27: big_exceptions<27> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 28: big_exceptions<28> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 29: big_exceptions<29> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 30: big_exceptions<30> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 31: big_exceptions<31> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			default: break;
+		}
+		if (thd_id == 0) {
+			for (p = 0; p < valid_idx; p++) {
+				c[idx + p] = c_idx[p];
+			}
+		}
+	}
+	else if (d4c_label == 1) {
+		float c_idx[part] = {0.0f};
+		switch (valid_idx) {
+			case 1: small_exceptions<1> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 2: small_exceptions<2> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 3: small_exceptions<3> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 4: small_exceptions<4> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 5: small_exceptions<5> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 6: small_exceptions<6> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 7: small_exceptions<7> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 8: small_exceptions<8> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 9: small_exceptions<9> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 10: small_exceptions<10> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 11: small_exceptions<11> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 12: small_exceptions<12> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 13: small_exceptions<13> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 14: small_exceptions<14> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 15: small_exceptions<15> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 16: small_exceptions<16> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 17: small_exceptions<17> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 18: small_exceptions<18> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 19: small_exceptions<19> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 20: small_exceptions<20> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 21: small_exceptions<21> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 22: small_exceptions<22> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 23: small_exceptions<23> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 24: small_exceptions<24> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 25: small_exceptions<25> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 26: small_exceptions<26> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 27: small_exceptions<27> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 28: small_exceptions<28> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 29: small_exceptions<29> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 30: small_exceptions<30> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			case 31: small_exceptions<31> (idx_a_base, idx, thd_id, d4a, a, b, c_idx, idx_b_base); break;
+			default: break;
+		}
+		if (thd_id == 0) {
+			for (p = valid_idx; p < part; p++) {
+				c[idx + p] = c_idx[p];
+			}
+		}
+	}
+}
+
+__global__ void mm4d_gpu_mode3_c_padz(float* a, float* b, float* c, int* dilation, int Window, int Padding, int d2, int d3, int d4a, int d4b, int d4c, int aSize, int bSize, int cSize) {
+	int idx_a, idx_b, idx;
+	int bx, by, tx, ty, B;
+	float aa, bb;
+
+	bx = blockIdx.x;
+	by = blockIdx.y;
+	tx = threadIdx.x;
+	ty = threadIdx.y;
+	B = blockDim.x*blockDim.y;
+	idx = (by*gridDim.x*B + bx*B + ty*blockDim.x + tx)/32;
+	int l = idx / (d2 * d3 * d4c);
+	int i = (idx / (d3 * d4c)) % d2;
+	int q = (idx / d4c) % d3;
+	int j = idx % d4c;
+	int D = dilation[q];
+	int warp_id = (by*gridDim.x*B + bx*B + ty*blockDim.x + tx)%32;
+	float sum = 0.0f;
+	if (idx >= cSize) return;
+	c[idx] = 0.0f;
+	int condition = i + D * (j - Window);
+	if (condition < 0 || condition >= d2) return;
+
+	for (int ii = 0; ii < (d4a + abs(32 - d4a) % 32); ii += 32) {
+		if (ii + warp_id < aSize) {idx_a = (((l * d2) + i) * d3 + q) *  d4a + ii + warp_id; aa = a[idx_a];} else {aa = 0.0f;}
+		if (ii + warp_id < bSize) {idx_b = (((l * d2) + i + D * (j - Window)) * d3 + q) *  d4b + ii + warp_id; bb = b[idx_b];} else {bb = 0.0f;}
+		sum += aa * bb;
+	}
+	__syncwarp();
+	for (int offset = 16; offset > 0; offset /= 2) {
+		sum += __shfl_xor_sync(0xffffffff, sum, offset, 32);
+	}
+	if (warp_id == 0) {
+		c[idx] = sum;
+	}
+}
+
+__global__ void mm4d_gpu_mode1_c(float* a, float* b, float* c, int* dilation, int Window, int Padding, int d2, int d3, int d4a, int d4b, int d4c, int aSize, int bSize, int cSize) {
+	int idx_a, idx_b, idx;
+	int bx, by, tx, ty, B;
+
+	bx = blockIdx.x;
+	by = blockIdx.y;
+	tx = threadIdx.x;
+	ty = threadIdx.y;
+	B = blockDim.x*blockDim.y;
+	idx = by*gridDim.x*B + bx*B + ty*blockDim.x + tx;
+
+	int l = idx / (d2 * d3 * d4c);
+	int i = (idx / (d3 * d4c)) % d2;
+	int q = (idx / d4c) % d3;
+	int j = idx % d4c;
+	int D = dilation[q];
+
+	if (idx < cSize) {
+		c[idx] = 0.0f;
+		for (int k = 0; k < d4a; k++) {
+			int condition = i + D * (k - Window);
+			if (condition >= 0 && condition < d2) {
+				idx_a = (((l * d2) + i) * d3 + q) *  d4a + k;
+				idx_b = (((l * d2) + i + D * (k - Window)) * d3 + q) *  d4b + j;
+				if (idx_a < aSize && idx_b < bSize)	c[idx] += a[idx_a] * b[idx_b];
+			}
+			else {
+				c[idx] += Padding;
+			}
+		}
+	}
+}
+
+__global__ void mm4d_gpu_mode2_c(float* a, float* b, float* c, int* dilation, int Window, int WindowUpper, int d2, int d3, int d4a, int d4b, int d4c, int aSize, int bSize, int cSize) {
+	int idx_a, idx_b, idx;
+	int bx, by, tx, ty, B;
+
+	bx = blockIdx.x;
+	by = blockIdx.y;
+	tx = threadIdx.x;
+	ty = threadIdx.y;
+	B = blockDim.x*blockDim.y;
+	idx = by*gridDim.x*B + bx*B + ty*blockDim.x + tx;
+
+	int l = idx / (d2 * d3 * d4c);
+	int i = (idx / (d3 * d4c)) % d2;
+	int q = (idx / d4c) % d3;
+	int j = idx % d4c;
+	int D = dilation[q];
+
+	if (idx < cSize) {
+		c[idx] = 0.0f;
+		for (int k = 0; k < d4a; k++) {
+			int condition = i + D * (k - WindowUpper);
+			if (condition >= 0 && condition < d2) {
+				idx_a = (((l * d2) + i + D * (k - WindowUpper)) * d3 + q) *  d4a + WindowUpper + Window - k;
+				idx_b = (((l * d2) + i + D * (k - WindowUpper)) * d3 + q) *  d4b + j;
+				if (idx_a < aSize && idx_b < bSize)	c[idx] += a[idx_a] * b[idx_b];
+			}
+		}
+	}
+}
+
+__global__ void mm4d_gpu_mode3_c(float* a, float* b, float* c, int* dilation, int Window, int Padding, int d2, int d3, int d4a, int d4b, int d4c, int aSize, int bSize, int cSize) {
+	int idx_a, idx_b, idx;
+	int bx, by, tx, ty, B;
+
+	bx = blockIdx.x;
+	by = blockIdx.y;
+	tx = threadIdx.x;
+	ty = threadIdx.y;
+	B = blockDim.x*blockDim.y;
+	idx = by*gridDim.x*B + bx*B + ty*blockDim.x + tx;
+
+	int l = idx / (d2 * d3 * d4c);
+	int i = (idx / (d3 * d4c)) % d2;
+	int q = (idx / d4c) % d3;
+	int j = idx % d4c;
+	int D = dilation[q];
+
+	if (idx < cSize) {
+		c[0] = 0.0f;
+		int condition = i + D * (j - Window);
+		for (int k = 0; k < d4a; k++) {
+			if (condition >= 0 && condition < d2) {
+				idx_a = (((l * d2) + i) * d3 + q) *  d4a + k;
+				idx_b = (((l * d2) + i + D * (j - Window)) * d3 + q) *  d4b + k;
+				if (idx_a < aSize && idx_b < bSize)	c[idx] += a[idx_a] * b[idx_b];
+			}
+			else {
+				c[idx] += Padding;
+			}
+		}
+	}
+}
+
+__global__ void mm4d_gpu_mode1_padz(float* a, float* b, float* c, int* dilation, int Window, int Padding, int d2, int d3, int d4a, int d4b, int d4c, int aSize, int bSize, int cSize) {
+	int idx_a, idx_b, idx;
+	int bx, by, tx, ty, B;
+
+	bx = blockIdx.x;
+	by = blockIdx.y;
+	tx = threadIdx.x;
+	ty = threadIdx.y;
+	B = blockDim.x*blockDim.y;
+	idx = bx*gridDim.y*B + by*B + tx*blockDim.y + ty;
+
+	int l = idx / (d2 * d3 * d4c);
+	int i = (idx / (d3 * d4c)) % d2;
+	int q = (idx / d4c) % d3;
+	int j = idx % d4c;
+	int D = dilation[q];
+
+	if (idx < cSize) {
+		c[idx] = 0.0f;
+		for (int k = 0; k < d4a; k++) {
+			int condition = i + D * (k - Window);
+			if (condition >= 0 && condition < d2) {
+				idx_a = (((l * d2) + i) * d3 + q) *  d4a + k;
+				idx_b = (((l * d2) + i + D * (k - Window)) * d3 + q) *  d4b + j;
+				if (idx_a < aSize && idx_b < bSize)	c[idx] += a[idx_a] * b[idx_b];
+			}
+		}
+	}
+}
+
+__global__ void mm4d_gpu_mode3_padz(float* a, float* b, float* c, int* dilation, int Window, int Padding, int d2, int d3, int d4a, int d4b, int d4c, int aSize, int bSize, int cSize) {
+	int idx_a, idx_b, idx;
+	int bx, by, tx, ty, B;
+
+	bx = blockIdx.x;
+	by = blockIdx.y;
+	tx = threadIdx.x;
+	ty = threadIdx.y;
+	B = blockDim.x*blockDim.y;
+	idx = bx*gridDim.y*B + by*B + tx*blockDim.y + ty;
+
+	int l = idx / (d2 * d3 * d4c);
+	int i = (idx / (d3 * d4c)) % d2;
+	int q = (idx / d4c) % d3;
+	int j = idx % d4c;
+	int D = dilation[q];
+
+	if (idx < cSize) {
+		c[0] = 0.0f;
+		int condition = i + D * (j - Window);
+		for (int k = 0; k < d4a; k++) {
+			if (condition >= 0 && condition < d2) {
+				idx_a = (((l * d2) + i) * d3 + q) * d4a + k;
+				idx_b = (((l * d2) + i + D * (j - Window)) * d3 + q) *  d4b + k;
+				if (idx_a < aSize && idx_b < bSize)	c[idx] += a[idx_a] * b[idx_b];
+			}
+		}
+	}
+}
+
+__global__ void mm4d_gpu_mode1(float* a, float* b, float* c, int* dilation, int Window, int Padding, int d2, int d3, int d4a, int d4b, int d4c, int aSize, int bSize, int cSize) {
+	int idx_a, idx_b, idx;
+	int bx, by, tx, ty, B;
+
+	bx = blockIdx.x;
+	by = blockIdx.y;
+	tx = threadIdx.x;
+	ty = threadIdx.y;
+	B = blockDim.x*blockDim.y;
+	idx = bx*gridDim.y*B + by*B + tx*blockDim.y + ty;
+
+	int l = idx / (d2 * d3 * d4c);
+	int i = (idx / (d3 * d4c)) % d2;
+	int q = (idx / d4c) % d3;
+	int j = idx % d4c;
+	int D = dilation[q];
+
+	if (idx < cSize) {
+		c[idx] = 0.0f;
+		for (int k = 0; k < d4a; k++) {
+			int condition = i + D * (k - Window);
+			if (condition >= 0 && condition < d2) {
+				idx_a = (((l * d2) + i) * d3 + q) *  d4a + k;
+				idx_b = (((l * d2) + i + D * (k - Window)) * d3 + q) *  d4b + j;
+				if (idx_a < aSize && idx_b < bSize)	c[idx] += a[idx_a] * b[idx_b];
+			}
+			else {
+				c[idx] += Padding;
+			}
+		}
+	}
+}
+
+__global__ void mm4d_gpu_mode2(float* a, float* b, float* c, int* dilation, int Window, int WindowUpper, int d2, int d3, int d4a, int d4b, int d4c, int aSize, int bSize, int cSize) {
+	int idx_a, idx_b, idx;
+	int bx, by, tx, ty, B;
+
+	bx = blockIdx.x;
+	by = blockIdx.y;
+	tx = threadIdx.x;
+	ty = threadIdx.y;
+	B = blockDim.x*blockDim.y;
+	idx = bx*gridDim.y*B + by*B + tx*blockDim.y + ty;
+
+	int l = idx / (d2 * d3 * d4c);
+	int i = (idx / (d3 * d4c)) % d2;
+	int q = (idx / d4c) % d3;
+	int j = idx % d4c;
+	int D = dilation[q];
+
+	if (idx < cSize) {
+		c[idx] = 0.0f;
+		for (int k = 0; k < d4a; k++) {
+			int condition = i + D * (k - WindowUpper);
+			if (condition >= 0 && condition < d2) {
+				idx_a = (((l * d2) + i + D * (k - WindowUpper)) * d3 + q) *  d4a + WindowUpper + Window - k;
+				idx_b = (((l * d2) + i + D * (k - WindowUpper)) * d3 + q) *  d4b + j;
+				if (idx_a < aSize && idx_b < bSize)	c[idx] += a[idx_a] * b[idx_b];
+			}
+		}
+	}
+}
+
+__global__ void mm4d_gpu_mode3(float* a, float* b, float* c, int* dilation, int Window, int Padding, int d2, int d3, int d4a, int d4b, int d4c, int aSize, int bSize, int cSize) {
+	int idx_a, idx_b, idx;
+	int bx, by, tx, ty, B;
+
+	bx = blockIdx.x;
+	by = blockIdx.y;
+	tx = threadIdx.x;
+	ty = threadIdx.y;
+	B = blockDim.x*blockDim.y;
+	idx = bx*gridDim.y*B + by*B + tx*blockDim.y + ty;
+
+	int l = idx / (d2 * d3 * d4c);
+	int i = (idx / (d3 * d4c)) % d2;
+	int q = (idx / d4c) % d3;
+	int j = idx % d4c;
+	int D = dilation[q];
+
+	if (idx < cSize) {
+		c[0] = 0.0f;
+		int condition = i + D * (j - Window);
+		for (int k = 0; k < d4a; k++) {
+			if (condition >= 0 && condition < d2) {
+				idx_a = (((l * d2) + i) * d3 + q) * d4a + k;
+				idx_b = (((l * d2) + i + D * (j - Window)) * d3 + q) *  d4b + k;
+				if (idx_a < aSize && idx_b < bSize)	c[idx] += a[idx_a] * b[idx_b];
+			}
+			else {
+				c[idx] += Padding;
+			}
+		}
+	}
+}
+
+void mm4d_cpu_mode1(float* a, float* b, float* c, int* dilation, int Window, int Padding, int d2, int d3, int d4a, int d4b, int d4c, int aSize, int bSize, int cSize) {
+	int idx_a, idx_b, idx;
+
+	for (idx = 0; idx < cSize; idx++) {
+		int l = idx / (d2 * d3 * d4c);
+		int i = (idx / (d3 * d4c)) % d2;
+		int q = (idx / d4c) % d3;
+		int j = idx % d4c;
+		int D = dilation[q];
+		c[idx] = 0.0f;
+
+		for (int k = 0; k < d4a; k++) {
+			int condition = i + D * (k - Window);
+			if (condition >= 0 && condition < d2) {
+				idx_a = (((l * d2) + i) * d3 + q) *  d4a + k;
+				idx_b = (((l * d2) + i + D * (k - Window)) * d3 + q) *  d4b + j;
+				if (idx_a < aSize && idx_b < bSize)	c[idx] += a[idx_a] * b[idx_b];
+			}
+			else {
+				c[idx] += Padding;
+			}
+		}
+	}
+}
+
+void mm4d_cpu_mode2(float* a, float* b, float* c, int* dilation, int Window, int WindowUpper, int d2, int d3, int d4a, int d4b, int d4c, int aSize, int bSize, int cSize) {
+	int idx_a, idx_b, idx;
+
+	for (idx = 0; idx < cSize; idx++) {
+		int l = idx / (d2 * d3 * d4c);
+		int i = (idx / (d3 * d4c)) % d2;
+		int q = (idx / d4c) % d3;
+		int j = idx % d4c;
+		int D = dilation[q];
+		c[idx] = 0.0f;
+
+		for (int k = 0; k < d4a; k++) {
+			int condition = i + D * (k - WindowUpper);
+			if (condition >= 0 && condition < d2) {
+				idx_a = (((l * d2) + i + D * (k - WindowUpper)) * d3 + q) *  d4a + WindowUpper + Window - k;
+				idx_b = (((l * d2) + i + D * (k - WindowUpper)) * d3 + q) *  d4b + j;
+				if (idx_a < aSize && idx_b < bSize)	c[idx] += a[idx_a] * b[idx_b];
+			}
+		}
+	}
+}
+
+void mm4d_cpu_mode3(float* a, float* b, float* c, int* dilation, int Window, int Padding, int d2, int d3, int d4a, int d4b, int d4c, int aSize, int bSize, int cSize) {
+	int idx_a, idx_b, idx;
+
+	for (idx = 0; idx < cSize; idx++) {
+		int l = idx / (d2 * d3 * d4c);
+		int i = (idx / (d3 * d4c)) % d2;
+		int q = (idx / d4c) % d3;
+		int j = idx % d4c;
+		int D = dilation[q];
+		c[idx] = 0.0f;
+
+		int condition = i + D * (j - Window);
+		for (int k = 0; k < d4a; k++) {
+			if (condition >= 0 && condition < d2) {
+				idx_a = (((l * d2) + i) * d3 + q) * d4a + k;
+				idx_b = (((l * d2) + i + D * (j - Window)) * d3 + q) *  d4b + k;
+				if (idx_a < aSize && idx_b < bSize)	c[idx] += a[idx_a] * b[idx_b];
+			}
+			else {
+				c[idx] += Padding;
+			}
+		}
+	}
+}
+
+void lformerMM_original(array4d_t<float>& input1, array4d_t<float>& input2, array4d_t<float>& output1, array1d_t<int>& dilation, array1d_t<int>& params, bool GPU){
+	int* d = dilation.data_ptr;
+	float* a = input1.data_ptr, *b = input2.data_ptr, *c = output1.data_ptr;
+	int d1 = output1.last_count, d2 = output1.matrix_count, d3 = output1.row_count;
+	int d4a = input1.col_count, d4b = input2.col_count, d4c = output1.col_count;
+	int aSize = d1*d2*d3*d4a, bSize = d1*d2*d3*d4b, cSize = d1*d2*d3*d4c;
+	int Window = params.data_ptr[0], WindowUpper = params.data_ptr[1], Padding = params.data_ptr[2], transposeT1 = params.data_ptr[3], coalesced = params.data_ptr[4];
+	printf("params: %d %d %d %d %d\n", Window, WindowUpper, Padding, transposeT1, coalesced);
+
+	dim3 blockSize(16, 16);
+	dim3 gridSize((d1 * d2 + blockSize.x - 1) / blockSize.x, (d3 * d4c + blockSize.y - 1) / blockSize.y);
+
+	//mode 1 and mode 3 are for forward
+	//mode 2 and mode 3 are for backward
+	if (d4c == d4b) {//mode 1 or mode 2
+		if (transposeT1 == 0) {//mode 1: can be called in forward and backward
+			if (!GPU) mm4d_cpu_mode1(a, b, c, d, Window, Padding, d2, d3, d4a, d4b, d4c, aSize, bSize, cSize);
+			//else if (coalesced == 1 && Padding == 0) mm4d_gpu_mode1_c_padz <<<gridSize, blockSize >>>(a, b, c, d, Window, Padding, d2, d3, d4a, d4b, d4c, aSize, bSize, cSize);
+			else if (coalesced == 1) mm4d_gpu_mode1_c <<<gridSize, blockSize >>>(a, b, c, d, Window, Padding, d2, d3, d4a, d4b, d4c, aSize, bSize, cSize);
+			else if (Padding == 0) mm4d_gpu_mode1_padz <<<gridSize, blockSize >>>(a, b, c, d, Window, Padding, d2, d3, d4a, d4b, d4c, aSize, bSize, cSize);
+			else mm4d_gpu_mode1 <<<gridSize, blockSize >>>(a, b, c, d, Window, Padding, d2, d3, d4a, d4b, d4c, aSize, bSize, cSize);
+		}
+		else {// mode 2: called during gradient back-propagation
+			if (!GPU) mm4d_cpu_mode2(a, b, c, d, Window, WindowUpper, d2, d3, d4a, d4b, d4c, aSize, bSize, cSize);
+			else if (coalesced == 1) mm4d_gpu_mode2_c <<<gridSize, blockSize >>>(a, b, c, d, Window, WindowUpper, d2, d3, d4a, d4b, d4c, aSize, bSize, cSize);
+			else mm4d_gpu_mode2 <<<gridSize, blockSize >>>(a, b, c, d, Window, WindowUpper, d2, d3, d4a, d4b, d4c, aSize, bSize, cSize);
+		}
+	}
+	else {//mode 3: can be called in forward and backward
+		if (!GPU) mm4d_cpu_mode3(a, b, c, d, Window, Padding, d2, d3, d4a, d4b, d4c, aSize, bSize, cSize);
+		else if (coalesced == 1 && Padding == 0) mm4d_gpu_mode3_c_padz <<<gridSize, blockSize>>>(a, b, c, d, Window, Padding, d2, d3, d4a, d4b, d4c, aSize, bSize, cSize);
+		else if (coalesced == 1) mm4d_gpu_mode3_c <<<gridSize, blockSize>>>(a, b, c, d, Window, Padding, d2, d3, d4a, d4b, d4c, aSize, bSize, cSize);
+		else if (Padding == 0) mm4d_gpu_mode3_padz <<<gridSize, blockSize>>>(a, b, c, d, Window, Padding, d2, d3, d4a, d4b, d4c, aSize, bSize, cSize);
+		else mm4d_gpu_mode3 <<<gridSize, blockSize>>>(a, b, c, d, Window, Padding, d2, d3, d4a, d4b, d4c, aSize, bSize, cSize);
+	}
+	cudaError_t cudaStatus = cudaGetLastError();
+	if (cudaStatus != cudaSuccess) printf("CUDA error: %s\n", cudaGetErrorString(cudaStatus));
+}
+
+void lformerMM(array4d_t<float>& input1, array4d_t<float>& input2, array4d_t<float>& output1, array1d_t<int>& dilation, array1d_t<int>& params, bool GPU){
+	int* d = dilation.data_ptr;
+	float* a = input1.data_ptr;
+    float* b = input2.data_ptr;
+    float* c = output1.data_ptr;
+	int Window = params.data_ptr[0], WindowUpper = params.data_ptr[1], Padding = params.data_ptr[2], transposeT1 = params.data_ptr[3], coalesced = params.data_ptr[4];
+
+    // printf("params: %d %d %d %d %d\n", Window, WindowUpper, Padding, transposeT1, coalesced);
+
+    /*
+	int *valid_j = (int *)malloc((invalid_idx +1) * sizeof(int));  // valid_j : valid numbers of j
+	int *start_i = (int *)malloc((invalid_idx +1) * sizeof(int));  // start_i : index of first element
+	int *start_i_last = (int *)malloc(i_last_part * sizeof(int));
+
+	int *v_j, *s_i, *s_i_l;
+    int l_size, i_last; // l_size: valid elements in i, q, j
+	cudaMalloc(&v_j, (invalid_idx +1) * sizeof(int));
+	cudaMalloc(&s_i, (invalid_idx +1) * sizeof(int));
+	cudaMalloc(&s_i_l, i_last_part * sizeof(int));
+	compute_half1_invalid_idx(valid_j, start_i, start_i_last, &l_size, &i_last);
+	cudaMemcpy(v_j, valid_j, (invalid_idx +1) * sizeof(int), cudaMemcpyHostToDevice);
+	cudaMemcpy(s_i, start_i, (invalid_idx +1) * sizeof(int), cudaMemcpyHostToDevice);
+	cudaMemcpy(s_i_l, start_i_last, i_last_part * sizeof(int), cudaMemcpyHostToDevice);
+    */
+
+	dim3 blockSize(8, 8);
+	dim3 gridSize((d1 * d2 + blockSize.x - 1) / blockSize.x, (d3 * d4c + blockSize.y - 1) / blockSize.y);
+
+    dim3 blocks(32, 4);
+	dim3 gridSize_c(((32/part)*(d1 * d2 + blocks.x - 1) / blocks.x), (d3 * d4c + blocks.y - 1) / blocks.y);
+	//dim3 grids ((d1*d2*d4c + 3) /4, d3);
+	//dim3 grids (d4c, d1*((d2 + 3)/4), d3);
+	//dim3 grids ((d4c + part_1)/part, d1*((d2 + 3)/4), d3); //pr4
+	dim3 grids ((d4c + part_1)/part, d1*((d2 + 7)/8), d3); //pr5
+	//printf("%d, %d %d, %d, %d %d %d %d %d\n", d1, d2, d3, d4a, d4b, d4c, grids.x, gridSize_c.x, gridSize_c.y);
+	//double start = mywtime();
+
+	if (d4c != d4b) { //mode3
+		throw std::invalid_argument("it is mode 3 kernel");
+		if (coalesced == 1)
+            //mm4d_gpu_mode3_c_padz_new<<<gridSize_c, blocks>>>(a, b, c, d, v_j, s_i, s_i_l, l_size, i_last);
+            //for (int iii = 0; iii < 20; ++iii)
+            mm4d_gpu_mode3_pr5<<<grids, blocks>>>(a, b, c, d, Window, Padding);
+		else
+            mm4d_gpu_mode3_c_padz_old<<<gridSize, blockSize>>>(a, b, c, d);
+	}
+	else {
+            float *b_re;
+            cudaMalloc(&b_re, bSize * sizeof(float));
+            dim3 blocks_m(32, 4);
+            dim3 grids_b((d1 * d2 + blocks_m.x - 1) / blocks_m.x, (d3 * d4b + blocks_m.y - 1) / blocks_m.y);
+            dim3 grids_m1((d4c + part_1)/part, d1*((d2 + 3)/4), d3); //
+            rearrange_b<<<grids_b, blocks_m>>>(b, b_re);
+            if (transposeT1 == 0) {
+                if (coalesced == 1) {
+                    // mm4d_gpu_mode1_pr4_new<<<grids_m1, blocks_m>>>(a, b, c, d);
+                    mm4d_gpu_mode1_new<<<grids_m1, blocks_m>>>(a, b_re, c, d);
+                }
+                else mm4d_gpu_mode1_c_padz_old<<<gridSize, blockSize>>>(a, b, c, d);
+            }
+            else{
+                if (coalesced == 1) {
+                    //float *a_re;
+                    //cudaMalloc(&a_re, aSize * sizeof(float));
+                    dim3 grids_m2((d4c_m1 + part_1)/part, d1*((d2 + 3)/4), d3); //
+                    //dim3 grids_a((d1 * d2 + blocks_m.x - 1) / blocks_m.x, (d3 * d4a + blocks_m.y - 1) / blocks_m.y);
+                    //rearrange_a_mode2<<<grids_a, blocks_m>>>(a, a_re, d, Window, WindowUpper);
+                    // mm4d_gpu_mode2_pr4_new<<<grids_m2, blocks_m>>>(a_re, b, c, d);
+                    mm4d_gpu_mode2_new<<<grids_m2, blocks_m>>>(a, b_re, c, d);
+                    //cudaFree(a_re);}
+                    }
+                else mm4d_gpu_mode2_c_old<<<gridSize, blockSize>>>(a, b, c, d);
+            }
+            cudaFree(b_re);
+	}
+
+	/*
+ 	cudaDeviceSynchronize();
+	double end = mywtime();
+	printf("cuda time = %f\n", (end - start)/20.0);
+    */
+	/*
+    cudaFree(s_i); cudaFree(s_i_l); cudaFree(v_j);
+	delete[] start_i; delete[] start_i_last, delete[] valid_j;
+    */
+}

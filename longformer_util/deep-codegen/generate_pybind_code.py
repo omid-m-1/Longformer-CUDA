@@ -68,7 +68,7 @@ def create_definition(output_list, array_dim_list, function_name):
 def create_transform_code(output_list, write_string, var_list, array_index_list, function_name):
     for each in output_list:
         if each[0] == 1 and each[2] in [1, 2, 3, 4]:
-            write_string += f'        array{each[2]}d_t<{each[3]}> {each[1]}_array = capsule_to_array<{each[3]}>{each[2]}d('
+            write_string += f'        array{each[2]}d_t<{each[3]}> {each[1]}_array = capsule_to_array{each[2]}d<{each[3]}>('
             write_string += f'{each[1]});\n'
     
     write_string += f'    return {function_name}('
