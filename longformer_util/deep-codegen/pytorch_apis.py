@@ -61,8 +61,8 @@ class lformerMM_impl(th.autograd.Function):
         is_diagonal = ctx.is_diagonal
         autoregressive = ctx.autoregressive
         device0 = ctx.device0
-        if not dZ.is_contiguous():
-            dZ = dZ.contiguous()
+        #if not dZ.is_contiguous():
+            #dZ = dZ.contiguous()
         #dZ = lformerMM_impl._prepare_tensors(dZ) #batch = 1
         is_diagonal = not is_diagonal
         dim1_0, dim1_1, dim1_2, dim1_3 = lformerMM_impl._out_size(dZ, input2, window, dilation, is_diagonal, autoregressive=autoregressive)

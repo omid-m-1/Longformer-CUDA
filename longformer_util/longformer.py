@@ -146,7 +146,9 @@ class LongformerSelfAttention(nn.Module):
         q = q.view(seq_len, bsz, self.num_heads, self.head_dim).transpose(0, 1)
         k = k.view(seq_len, bsz, self.num_heads, self.head_dim).transpose(0, 1)
         # attn_weights = (bsz, seq_len, num_heads, window*2+1)
-        if self.attention_mode == 'tvm':
+        if self.attention_mode == 'dcg':
+            attn_weights = lformerMM(q, k, self.attention_window, self.attention_dilation, False, False)
+        elif self.attention_mode == 'tvm':
             q = q.float().contiguous()
             k = k.float().contiguous()
             attn_weights = diagonaled_mm_tvm(q, k, self.attention_window, self.attention_dilation, False, 0, False)
@@ -154,10 +156,6 @@ class LongformerSelfAttention(nn.Module):
             attn_weights = sliding_chunks_matmul_qk(q, k, self.attention_window, padding_value=0)
         elif self.attention_mode == "sliding_chunks_no_overlap":
             attn_weights = sliding_chunks_no_overlap_matmul_qk(q, k, self.attention_window, padding_value=0)
-        elif self.attention_mode == 'dcg':
-            q = q.float().contiguous()
-            k = k.float().contiguous()
-            attn_weights = lformerMM(q, k, self.attention_window, self.attention_dilation, False, 0, False)
         else:
             raise False
         mask_invalid_locations(attn_weights, self.attention_window, self.attention_dilation, False)
@@ -172,16 +170,13 @@ class LongformerSelfAttention(nn.Module):
             float_mask = float_mask.repeat(1, 1, repeat_size, 1)
             ones = float_mask.new_ones(size=float_mask.size())  # tensor of ones
             # diagonal mask with zeros everywhere and -inf inplace of padding
-            if self.attention_mode == 'tvm':
+            if self.attention_mode == 'dcg' or self.attention_mode == 'tvm':
                 d_mask = diagonaled_mm_tvm(ones, float_mask, self.attention_window, self.attention_dilation, False, 0, False)
                 #if isinstance(self.attention_dilation, int): d_mask = d_mask[:, :, 0:1, :]
             elif self.attention_mode == "sliding_chunks":
                 d_mask = sliding_chunks_matmul_qk(ones, float_mask, self.attention_window, padding_value=0)
             elif self.attention_mode == "sliding_chunks_no_overlap":
                 d_mask = sliding_chunks_no_overlap_matmul_qk(ones, float_mask, self.attention_window, padding_value=0)
-            elif self.attention_mode == 'dcg':
-                d_mask = lformerMM(ones, float_mask, self.attention_window, self.attention_dilation, False, 0, False)
-
             attn_weights += d_mask
         assert list(attn_weights.size())[:3] == [bsz, seq_len, self.num_heads]
         assert attn_weights.size(dim=3) in [self.attention_window * 2 + 1, self.attention_window * 3]
@@ -213,16 +208,16 @@ class LongformerSelfAttention(nn.Module):
             attn = torch.matmul(selected_attn_probs.transpose(1, 2), selected_v.transpose(1, 2).type_as(selected_attn_probs)).transpose(1, 2)
             attn_probs = attn_probs.narrow(-1, max_num_extra_indices_per_batch, attn_probs.size(-1) - max_num_extra_indices_per_batch).contiguous()
 
-        if self.attention_mode == 'tvm':
+        if self.attention_mode == 'dcg':
+            #v = v.float().contiguous()
+            attn += lformerMM(attn_probs, v, self.attention_window, self.attention_dilation, True, False)
+        elif self.attention_mode == 'tvm':
             v = v.float().contiguous()
             attn += diagonaled_mm_tvm(attn_probs, v, self.attention_window, self.attention_dilation, True, 0, False)
         elif self.attention_mode == "sliding_chunks":
             attn += sliding_chunks_matmul_pv(attn_probs, v, self.attention_window)
         elif self.attention_mode == "sliding_chunks_no_overlap":
             attn += sliding_chunks_no_overlap_matmul_pv(attn_probs, v, self.attention_window)
-        elif self.attention_mode == 'dcg':
-            v = v.float().contiguous()
-            attn += lformerMM(attn_probs, v, self.attention_window, self.attention_dilation, True, 0, False)
         else:
             raise False
 

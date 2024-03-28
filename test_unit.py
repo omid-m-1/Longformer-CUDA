@@ -8,8 +8,9 @@ lformerMM = importlib.import_module("longformer_util.deep-codegen.pytorch_apis")
 
 import argparse
 
-default_input1 = [2, 4096, 12, -1]
-default_input2 = [2, 4096, 12, 64]
+default_input1 = [2, 4096, 12, -1] # mode 1 and mode 2: [2, 4096, 12, 513], mode 3: [2, 4096, 12, 64]
+default_input2 = [2, 4096, 12, 64] # mode 1, mode 2 and mode 3: [2, 4096, 12, 64]
+#default_output = [2, 4096, 12, -1] # mode 1 and mode 2: [2, 4096, 12, 64], mode 3: [2, 4096, 12, 513]
 padding = 0
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -70,6 +71,13 @@ if __name__ == '__main__':
     input2 = torch.rand(input2_dimensions, requires_grad=True, device=device)
     dilation = torch.tensor(dilation, dtype=torch.int, requires_grad=False, device=device)
 
+    output1 = lformerMM(input1, input2, window, dilation, is_diagonal, autoregressive)
+    output1 = lformerMM(input1, input2, window, dilation, is_diagonal, autoregressive)
+    random_target = torch.rand_like(output1, device=device)
+    #output2 = torch.einsum('bxcd,bycd->bxcy', (input1, input2))
+    #random_target_dense = torch.rand_like(output2, device=device)
+
+
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
         if kernel == 'dcg':
             output1 = lformerMM(input1, input2, window, dilation, is_diagonal, autoregressive)
@@ -77,7 +85,6 @@ if __name__ == '__main__':
             output1 = diagonaled_mm(input1, input2, window, dilation, is_diagonal, padding, autoregressive)
         else:
             if (mode ==3): output1 = torch.einsum('bxcd,bycd->bxcy', (input1, input2))
-        random_target = torch.rand_like(output1, device=device)
         loss = (output1 - random_target).pow(2).mean()
         loss.backward()
     print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10))
