@@ -3,6 +3,9 @@ from functools import lru_cache
 
 import torch
 import tvm
+
+from torch.utils import dlpack
+
 import os.path
 
 class DiagonaledMM(torch.autograd.Function):
@@ -194,7 +197,18 @@ class DiagonaledMM(torch.autograd.Function):
             # FIXME
             print('Error: the hidden dimension {m} shouldn\'t match number of diagonals {c}')
             assert False
-        _diagonaled_mm_function(t1, t2, r, d, w, w_upper, padding, transpose_t1, m if is_t1_diagonaled else c)
+        if t1.shape[0] == 1:
+            t1_tvm = tvm.nd.empty((b, n, h, t1.shape[3]), dtype = 'float32', device=tvm_device, mem_scope = 'global')
+            t2_tvm = tvm.nd.empty((b, n, h, m), dtype = 'float32', device=tvm_device, mem_scope = 'global')
+            dlpack_capsule_t1 = dlpack.to_dlpack(t1)
+            dlpack_capsule_t2 = dlpack.to_dlpack(t2)
+            t1 = tvm.nd.from_dlpack(dlpack_capsule_t1)
+            t2 = tvm.nd.from_dlpack(dlpack_capsule_t2)
+            t1_tvm.copyfrom(t1)
+            t2_tvm.copyfrom(t2)
+            _diagonaled_mm_function(t1_tvm, t2_tvm, r, d, w, w_upper, padding, transpose_t1, m if is_t1_diagonaled else c)
+        else:
+            _diagonaled_mm_function(t1, t2, r, d, w, w_upper, padding, transpose_t1, m if is_t1_diagonaled else c)
         r = r.to_dlpack()
         r = torch.from_dlpack(r)
         return r
