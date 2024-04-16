@@ -50,7 +50,7 @@ def average(data, filter_condition):
     return np.mean(cuda_times)
 
 kernels = ['tvm', 'dense', 'dcg']
-modes = [1, 3]
+modes = [1, 2, 3]
 heads = [12, 24]
 dilations = range(1,5)
 colors = {'tvm': 'blue', 'dense': 'green', 'dcg': 'red'}
