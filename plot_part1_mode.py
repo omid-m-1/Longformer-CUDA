@@ -2,6 +2,7 @@ import pickle
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
+import os
 
 plt.rcParams.update({'font.size': 14})
 
@@ -48,117 +49,55 @@ def average(data, filter_condition):
     cuda_times = [float(record[7].replace('us', '')) for record in filtered_data if record[7] is not None]
     if len(cuda_times) != len(filtered_data):
         return None
-    return np.mean(cuda_times)
-
-def plot_for_mode(ax, data, seq_len_func, batch_size_func, window_len_func, dilation_func, mode):
-    for kernel in kernels:
-        times_seq_len = [seq_len_func(kernel, mode, seq_len) for seq_len in sequence_lengths]
-        times_batch_size = [batch_size_func(kernel, mode, batch_size) for batch_size in batch_sizes]
-        times_window_len = [window_len_func(kernel, mode, window_len) for window_len in window_lengths]
-        times_dilation = [dilation_func(kernel, mode, dilation) for dilation in dilations]
+    return np.mean(cuda_times)/1000
 
 kernels = ['tvm', 'dense', 'dcg']
+modes = [1, 2, 3]
 heads = [12, 24]
-dilations = range(1, 5)
-colors = {1: 'blue', 2: 'green', 3: 'red'}
-styles = {'tvm': '--', 'dense': '-', 'dcg': '-.'}
-
-fig, axs = plt.subplots(2, 2, figsize=(14, 14))
-# Plot 1: Sequence Length
 sequence_lengths = range(512, 16385, 512)
-for kernel in kernels:
-    if kernel != 'dense':
-        modes = [[1], [2], [3]]
-    else:
-        modes = [[1, 2], [3]]
-    for mode in modes:
-        times = [average(list_seq, lambda record:
-            record[0] == kernel and
-            record[1] in mode and
-            record[2] == 2 and
-            record[3] in heads and
-            record[4] == 256 and
-            record[5] in dilations and
-            record[6] == seq_len)
-            for seq_len in sequence_lengths]
-        if any(time is not None for time in times):
-            axs[0, 0].plot(sequence_lengths, times, label=f'{kernel} Mode {mode[0]}', color=colors[mode[0]], linestyle=styles[kernel], linewidth = 3)
-axs[0, 0].set_xlabel('Sequence Length', labelpad=20)
-axs[0, 0].set_ylabel('CUDA Time (microseconds)', labelpad=20)
-axs[0, 0].set_title('CUDA Running Time vs Sequence Length', pad=20)
-# Plot 2: Batch Size
 batch_sizes = range(1, 17)
-for kernel in kernels:
-    if kernel != 'dense':
-        modes = [[1], [2], [3]]
-    else:
-        modes = [[1, 2], [3]]
-    for mode in modes:
-        times = [average(list_batch, lambda record:
-            record[0] == kernel and
-            record[1] in mode and
-            record[2] == batch_size and
-            record[3] in heads and
-            record[4] == 256 and
-            record[5] in range(1, 5) and
-            record[6] == 4096)
-            for batch_size in batch_sizes]
-        if any(time is not None for time in times):
-            axs[0, 1].plot(batch_sizes, times, label=f'{kernel} Mode {mode[0]}', color=colors[mode[0]], linestyle=styles[kernel], linewidth = 3)
-axs[0, 1].set_xlabel('Batch Size', labelpad=20)
-axs[0, 1].set_ylabel('CUDA Time (microseconds)', labelpad=20)
-axs[0, 1].set_title('CUDA Running Time vs Batch Size', pad=20)
-# Plot 3: Window Length
 window_lengths = range(64, 1025, 64)
-for kernel in kernels:
-    if kernel != 'dense':
-        modes = [[1], [2], [3]]
-    else:
-        modes = [[1, 2], [3]]
-    for mode in modes:
-        times = [average(list_window, lambda record:
-            record[0] == kernel and
-            record[1] in mode and
-            record[2] == 2 and
-            record[3] in heads and
-            record[4] == window_len and
-            record[5] in dilations and
-            record[6] == 4096)
-            for window_len in window_lengths]
-        if any(time is not None for time in times):
-            axs[1, 0].plot(window_lengths, times, label=f'{kernel} Mode {mode[0]}', color=colors[mode[0]], linestyle=styles[kernel], linewidth = 3)
-axs[1, 0].set_xlabel('Window Length', labelpad=20)
-axs[1, 0].set_ylabel('CUDA Time (microseconds)', labelpad=20)
-axs[1, 0].set_title('CUDA Running Time vs Window Length', pad=20)
-# Plot 3: Dilation
-#dilations = range(1, 5)
-for kernel in kernels:
-    if kernel != 'dense':
-        modes = [[1], [2], [3]]
-    else:
-        modes = [[1, 2], [3]]
-    for mode in modes:
-        times = [average(list_dilation, lambda record:
-            record[0] == kernel and
-            record[1] in mode and
-            record[2] == 2 and
-            record[3] in heads and
-            record[4] == 256 and
-            record[5] == dilation and
-            record[6] == 4096)
-            for dilation in dilations]
-        if any(time is not None for time in times):
-            axs[1, 1].plot(dilations, times, label=f'{kernel} Mode {mode[0]}', color=colors[mode[0]], linestyle=styles[kernel], linewidth = 3)
-axs[1, 1].set_xticks([1, 2, 3, 4])
-axs[1, 1].set_xlabel('Dilation', labelpad=15)
-axs[1, 1].set_ylabel('CUDA Time (microseconds)', labelpad=20)
-axs[1, 1].set_title('CUDA Running Time vs Dilation Rate', pad=20)
+dilations = range(1, 5)
 
-kernel_lines = [Line2D([0], [0], color='black', linestyle=styles[kernel]) for kernel in kernels]
-mode_lines = [Line2D([0], [0], color=colors[mode], linestyle='None', marker='o') for mode in range(1, 4)]
-kernel_legend = fig.legend(handles=kernel_lines, labels=kernels, loc='lower right', bbox_to_anchor=(0.85, 0.125), title='Kernel Type', ncol=1)
-mode_legend = fig.legend(handles=mode_lines, labels=[f'Mode {mode}' for mode in range(1, 4)], loc='lower right', bbox_to_anchor=(.975, 0.125), title='Mode Number', ncol=1)
+colors = {'tvm': 'green', 'dense': 'blue', 'dcg': 'red'}
+styles = {'tvm': '--', 'dense': '-', 'dcg': '-.'}
+x_label = ['Sequence Length', 'Batch Size', 'Window Length', 'Dilation']
+x_ticks = [np.arange(0, 16001, 4000), np.arange(1,9)*2, np.arange(0, 1001, 200), np.arange(1,5)]
+y_ticks = [np.arange(0, 51, 10), np.arange(0, 101, 20), np.arange(0, 41, 10), np.arange(4, 15, 2)]
 
-plt.tight_layout()
-plt.subplots_adjust(hspace=0.6, wspace=0.35, bottom=0.3)
-plt.savefig('Figure2.pdf', bbox_inches='tight')
+os.makedirs('./fig', exist_ok=True)
+for mode in modes:
+    times_seq = []
+    times_batch = []
+    times_window = []
+    times_dilation = []
+    for kernel in kernels:
+        if kernel != 'dense':
+            mode_list = [[1], [2], [3]]
+        else:
+            mode_list = [[1, 2], [1, 2], [3]]
+        times_seq.append([average(list_seq, lambda record: record[0] == kernel and record[1] in mode_list[mode-1] and record[2] == 2 and record[3] in heads and
+            record[4] == 256 and record[5] in dilations and record[6] == seq_len) for seq_len in sequence_lengths])
+        times_batch.append([average(list_batch, lambda record: record[0] == kernel and record[1] in mode_list[mode-1] and record[2] == batch_size and record[3] in heads and
+            record[4] == 256 and record[5] in dilations and record[6] == 4096) for batch_size in batch_sizes])
+        times_window.append([average(list_window, lambda record: record[0] == kernel and record[1] in mode_list[mode-1] and record[2] == 2 and record[3] in heads and
+            record[4] == window_len and record[5] in dilations and record[6] == 4096) for window_len in window_lengths])
+        times_dilation.append([average(list_dilation, lambda record: record[0] == kernel and record[1] in mode_list[mode-1] and record[2] == 2 and record[3] in heads and
+            record[4] == 256 and record[5] == dilation and record[6] == 4096) for dilation in dilations])
+    times = [times_seq, times_batch, times_window, times_dilation]
+    x_value = [sequence_lengths, batch_sizes, window_lengths, dilations]
+    for fig_id in range(4):
+        fig, axs = plt.subplots(figsize=(6, 4))
+        for kernel_id in range(3):
+            kernel = kernels[kernel_id]
+            if any(time is not None for time in times[fig_id][kernel_id]):
+                axs.plot(x_value[fig_id], times[fig_id][kernel_id], label=f'{kernel}', color=colors[kernel], linestyle=styles[kernel], linewidth=3)
+        axs.set_xticks(x_ticks[fig_id])
+        axs.set_yticks(y_ticks[fig_id])
+        axs.set_xlabel(x_label[fig_id], labelpad=15)
+        axs.set_ylabel('CUDA Time (milliseconds)', labelpad=15)
+        axs.set_title(f'CUDA Running Time vs {x_label[fig_id]}: Mode {mode}', pad=20)
+        axs.legend()
+        plt.tight_layout()
+        plt.savefig(f'./fig/{x_label[fig_id]}_Mode {mode}.pdf', bbox_inches='tight')
+        plt.close(fig)
