@@ -56,7 +56,7 @@ def calculate_slowdown(previous_time, current_time):
 
 kernels = ['tvm', 'dense', 'dcg']
 modes = [1, 2, 3]
-heads = [12]
+heads = [12, 24]
 sequence_lengths = range(512, 16385, 512)
 batch_sizes = range(1, 17)
 window_lengths = range(64, 1025, 64)
